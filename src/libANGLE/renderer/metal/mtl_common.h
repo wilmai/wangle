@@ -114,6 +114,7 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
 // Metal limits
 constexpr uint32_t kMaxShaderBuffers     = 31;
 constexpr uint32_t kMaxShaderSamplers    = 16;
+constexpr uint32_t kMaxShaderTextureBindings = 2 * kMaxShaderSamplers;
 constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
 constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
 constexpr uint32_t kMaxViewports         = 1;
@@ -158,6 +159,8 @@ constexpr uint32_t kDefaultUniformsBindingIndex = kDefaultAttribsBindingIndex + 
 constexpr uint32_t kTransformFeedbackBindingIndex = kDefaultUniformsBindingIndex + 1;
 // Binding index for UBO's argument buffer
 constexpr uint32_t kUBOArgumentBufferBindingIndex = kTransformFeedbackBindingIndex + 4;
+// Binding index for the compute shader storage-buffer argument buffer.
+constexpr uint32_t kSSBOArgumentBufferBindingIndex = kUBOArgumentBufferBindingIndex + 1;
 
 constexpr uint32_t kStencilMaskAll = 0xff;  // Only 8 bits stencil is supported
 
@@ -171,6 +174,7 @@ constexpr int kEmulatedAlphaValue = 1;
 constexpr size_t kOcclusionQueryResultSize = sizeof(uint64_t);
 
 constexpr gl::Version kMaxSupportedGLVersion = gl::Version(3, 0);
+constexpr gl::Version kMaxExperimentalGLES31Version = gl::Version(3, 1);
 
 enum class PixelType
 {

@@ -7,6 +7,7 @@
 #include "compiler/translator/Compiler.h"
 #include "common/unsafe_buffers.h"
 
+#include <limits>
 #include <sstream>
 
 #include "angle_gl.h"
@@ -707,10 +708,16 @@ void TCompiler::setShaderMetadata(const TParseContext &parseContext)
 
 unsigned int TCompiler::getSharedMemorySize() const
 {
+    constexpr unsigned int kMaxSize = std::numeric_limits<unsigned int>::max();
     unsigned int sharedMemSize = 0;
     for (const sh::ShaderVariable &var : mSharedVariables)
     {
-        sharedMemSize += var.getExternalSize();
+        const unsigned int variableSize = var.getExternalSize();
+        if (variableSize > kMaxSize - sharedMemSize)
+        {
+            return kMaxSize;
+        }
+        sharedMemSize += variableSize;
     }
 
     return sharedMemSize;

@@ -66,6 +66,38 @@ static EGLint GetDepthSize(GLint internalformat)
     }
 }
 
+static NSUInteger GetTextureBufferOffsetAlignment(id<MTLDevice> device)
+{
+    if (@available(macOS 27.0, macCatalyst 27.0, iOS 27.0, *))
+    {
+        constexpr MTLPixelFormat kTextureBufferFormats[] = {
+            MTLPixelFormatR8Unorm,    MTLPixelFormatR8Uint,       MTLPixelFormatR8Sint,
+            MTLPixelFormatR16Float,   MTLPixelFormatR16Uint,      MTLPixelFormatR16Sint,
+            MTLPixelFormatR32Float,   MTLPixelFormatR32Uint,      MTLPixelFormatR32Sint,
+            MTLPixelFormatRG8Unorm,   MTLPixelFormatRG8Uint,      MTLPixelFormatRG8Sint,
+            MTLPixelFormatRG16Float,  MTLPixelFormatRG16Uint,     MTLPixelFormatRG16Sint,
+            MTLPixelFormatRG32Float,  MTLPixelFormatRG32Uint,     MTLPixelFormatRG32Sint,
+            MTLPixelFormatRGB32Float, MTLPixelFormatRGB32Uint,    MTLPixelFormatRGB32Sint,
+            MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Uint,    MTLPixelFormatRGBA8Sint,
+            MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA16Uint,  MTLPixelFormatRGBA16Sint,
+            MTLPixelFormatRGBA32Float, MTLPixelFormatRGBA32Uint,  MTLPixelFormatRGBA32Sint,
+        };
+
+        NSUInteger alignment = 1;
+        for (MTLPixelFormat format : kTextureBufferFormats)
+        {
+            const NSUInteger formatAlignment = [device minimumTextureBufferAlignmentForPixelFormat:format];
+            if (formatAlignment == 0)
+            {
+                return 0;
+            }
+            alignment = std::max(alignment, formatAlignment);
+        }
+        return alignment;
+    }
+    return 0;
+}
+
 static EGLint GetStencilSize(GLint internalformat)
 {
     switch (internalformat)
@@ -431,6 +463,15 @@ gl::Version DisplayMtl::getMaxSupportedESVersion() const
     // FIXME: None of the feature conditions are checked for simulator support.
     return gl::Version(3, 0);
 #else
+    // GLES 3.1 is deliberately opt-in.  Keep the simulator out of this profile until its
+    // Metal feature emulation has been audited, and require the device capabilities used by the
+    // compute/SSBO implementation below.
+    if (mFeatures.enableExperimentalGles31.enabled && supportsEitherGPUFamily(4, 2) &&
+        [mMetalDevice maxBufferLength] >= (1ull << 27))
+    {
+        return mtl::kMaxExperimentalGLES31Version;
+    }
+
     if (supportsEitherGPUFamily(4, 1))
     {
         return mtl::kMaxSupportedGLVersion;
@@ -811,6 +852,7 @@ void DisplayMtl::ensureCapsInitialized() const
 
     // MSAA
     mNativeCaps.maxSamples             = mFormatTable.getMaxSamples();
+    mNativeCaps.maxFramebufferSamples  = mNativeCaps.maxSamples;
     mNativeCaps.maxSampleMaskWords     = 1;
     mNativeCaps.maxColorTextureSamples = mNativeCaps.maxSamples;
     mNativeCaps.maxDepthTextureSamples = mNativeCaps.maxSamples;
@@ -862,14 +904,31 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Vertex]   = mtl::kMaxShaderSamplers;
 
     // No info from Metal given, use default GLES3 spec values:
-    mNativeCaps.minProgramTexelOffset = -8;
-    mNativeCaps.maxProgramTexelOffset = 7;
+    mNativeCaps.minProgramTexelOffset         = -8;
+    mNativeCaps.maxProgramTexelOffset         = 7;
+    mNativeCaps.minProgramTextureGatherOffset = -8;
+    mNativeCaps.maxProgramTextureGatherOffset = 7;
 
-    // NOTE(hqle): support storage buffer.
-    const uint32_t maxPerStageStorageBuffers                     = 0;
+    // SSBOs are exposed only to the experimental profile.  Vertex, fragment, and compute stages
+    // share the same conservative eight-block limit.
+    const bool experimentalGLES31 = getMaxSupportedESVersion() >= gl::Version(3, 1);
+    const bool supportsShaderImageLoadStore =
+        experimentalGLES31 && [mMetalDevice readWriteTextureSupport] == MTLReadWriteTextureTier2;
+    bool supportsShaderImageAtomics = false;
+    if (supportsShaderImageLoadStore)
+    {
+        if (@available(macOS 14.0, iOS 17.0, *))
+        {
+            supportsShaderImageAtomics = supportsAppleGPUFamily(6) || supportsMacGPUFamily(2);
+        }
+    }
+    mNativeExtensions.shaderImageAtomicOES = supportsShaderImageAtomics;
+    mNativeCaps.maxUniformLocations = experimentalGLES31 ? 1024 : 0;
+    const uint32_t maxPerStageStorageBuffers = experimentalGLES31 ? 8u : 0u;
     mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Vertex]   = maxPerStageStorageBuffers;
     mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Fragment] = maxPerStageStorageBuffers;
-    mNativeCaps.maxCombinedShaderStorageBlocks                   = maxPerStageStorageBuffers;
+    mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] = maxPerStageStorageBuffers;
+    mNativeCaps.maxCombinedShaderStorageBlocks = experimentalGLES31 ? 8 : 0;
 
     // Fill in additional limits for UBOs and SSBOs.
     mNativeCaps.maxUniformBufferBindings = mNativeCaps.maxCombinedUniformBlocks;
@@ -887,9 +946,76 @@ void DisplayMtl::ensureCapsInitialized() const
             256;  // constant buffers on all other GPUs must be aligned to 256.
     }
 
-    mNativeCaps.maxShaderStorageBufferBindings     = 0;
-    mNativeCaps.maxShaderStorageBlockSize          = 0;
-    mNativeCaps.shaderStorageBufferOffsetAlignment = 0;
+    // Binding points are a context-wide indexed namespace. They can exceed the number of storage
+    // blocks active in a shader, which is limited separately above.
+    mNativeCaps.maxShaderStorageBufferBindings = experimentalGLES31 ? 8 : 0;
+    mNativeCaps.maxShaderStorageBlockSize =
+        experimentalGLES31 ? static_cast<GLint64>([mMetalDevice maxBufferLength]) : 0;
+    // Metal's setBuffer:offset: API requires a four-byte aligned offset.  The alpha binding
+    // path preserves this alignment when it binds a GLES range.
+    mNativeCaps.shaderStorageBufferOffsetAlignment = experimentalGLES31 ? 4 : 0;
+
+    mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Vertex] =
+        experimentalGLES31 ? gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS : 0;
+    mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Fragment] =
+        experimentalGLES31 ? gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS : 0;
+    mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Compute] =
+        experimentalGLES31 ? gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS : 0;
+    mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Vertex] = experimentalGLES31 ? 8 : 0;
+    mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Fragment] = experimentalGLES31 ? 8 : 0;
+    mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Compute] = experimentalGLES31 ? 8 : 0;
+    mNativeCaps.maxAtomicCounterBufferBindings =
+        experimentalGLES31 ? gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS : 0;
+    mNativeCaps.maxAtomicCounterBufferSize =
+        experimentalGLES31
+            ? static_cast<GLint>(std::min<uint64_t>([mMetalDevice maxBufferLength],
+                                                    std::numeric_limits<GLint>::max()))
+            : 0;
+    mNativeCaps.maxCombinedAtomicCounterBuffers =
+        experimentalGLES31 ? gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS : 0;
+    mNativeCaps.maxCombinedAtomicCounters = experimentalGLES31 ? 8 : 0;
+
+    if (experimentalGLES31)
+    {
+        const MTLSize maxThreadsPerThreadgroup = [mMetalDevice maxThreadsPerThreadgroup];
+        const uint64_t maxWorkGroupSizeProduct =
+            static_cast<uint64_t>(maxThreadsPerThreadgroup.width) *
+            static_cast<uint64_t>(maxThreadsPerThreadgroup.height) *
+            static_cast<uint64_t>(maxThreadsPerThreadgroup.depth);
+        // maxThreadsPerThreadgroup is a per-axis limit, not a total thread count. Metal 3's
+        // Apple GPU family 4 and newer families support at least 1024 threads per threadgroup;
+        // retain a conservative 512-thread limit for the older Mac family allowed by this gate.
+        const uint64_t maxTotalThreadsPerThreadgroup = supportsAppleGPUFamily(4) ? 1024u : 512u;
+        const uint64_t maxWorkGroupInvocations =
+            std::min(maxWorkGroupSizeProduct, maxTotalThreadsPerThreadgroup);
+
+        mNativeCaps.maxComputeWorkGroupCount = {{65535, 65535, 65535}};
+        mNativeCaps.maxComputeWorkGroupSize = {
+            {static_cast<GLint>(maxThreadsPerThreadgroup.width),
+             static_cast<GLint>(maxThreadsPerThreadgroup.height),
+             static_cast<GLint>(maxThreadsPerThreadgroup.depth)}};
+        mNativeCaps.maxComputeWorkGroupInvocations = static_cast<GLint>(
+            std::min<uint64_t>(maxWorkGroupInvocations, std::numeric_limits<GLint>::max()));
+        mNativeCaps.maxComputeSharedMemorySize = static_cast<GLint>(std::min<NSUInteger>(
+            [mMetalDevice maxThreadgroupMemoryLength], std::numeric_limits<GLint>::max()));
+        mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Compute]     = mtl::kMaxShaderUBOs;
+        mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Compute] = mtl::kMaxShaderSamplers;
+        mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Compute] =
+            maxDefaultUniformComponents;
+        mNativeCaps.maxCombinedShaderUniformComponents[gl::ShaderType::Compute] =
+            maxDefaultUniformComponents;
+        const GLuint maxShaderImages = supportsShaderImageLoadStore ? 4 : 0;
+        for (gl::ShaderType shaderType : {gl::ShaderType::Vertex, gl::ShaderType::Fragment,
+                                          gl::ShaderType::Compute})
+        {
+            mNativeCaps.maxShaderImageUniforms[shaderType] = maxShaderImages;
+        }
+        mNativeCaps.maxCombinedImageUniforms = maxShaderImages;
+        mNativeCaps.maxImageUnits            = maxShaderImages;
+        mNativeCaps.maxCombinedShaderOutputResources =
+            mNativeCaps.maxCombinedImageUniforms + mNativeCaps.maxCombinedShaderStorageBlocks +
+            mNativeCaps.maxColorAttachments;
+    }
 
     // UBO plus default uniform limits
     const uint32_t maxCombinedUniformComponents =
@@ -899,7 +1025,12 @@ void DisplayMtl::ensureCapsInitialized() const
         mNativeCaps.maxCombinedShaderUniformComponents[shaderType] = maxCombinedUniformComponents;
     }
 
-    mNativeCaps.maxCombinedShaderOutputResources = 0;
+    // The experimental profile exposes a conservative combined shader-output resource limit.
+    // This counts SSBOs, images, and fragment outputs together during link validation.
+    if (!experimentalGLES31)
+    {
+        mNativeCaps.maxCombinedShaderOutputResources = 0;
+    }
 
     mNativeCaps.maxTransformFeedbackInterleavedComponents =
         gl::IMPLEMENTATION_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS;
@@ -1012,6 +1143,24 @@ void DisplayMtl::initializeExtensions() const
     mNativeExtensions.textureNpotOES = true;
 
     mNativeExtensions.texture3DOES = true;
+
+    // GL_EXT_texture_buffer requires the RGB32 formats as well as shader image load/store.
+    // Metal added native RGB32 texture-buffer formats in macOS 27, so advertise the extension
+    // only when the device can create every required texture-buffer view.
+    if (getMaxSupportedESVersion() >= gl::Version(3, 1) &&
+        [mMetalDevice readWriteTextureSupport] == MTLReadWriteTextureTier2)
+    {
+        const NSUInteger offsetAlignment = GetTextureBufferOffsetAlignment(mMetalDevice);
+        const uint64_t maxTextureBufferSize =
+            std::min<uint64_t>(16 * 1024 * 1024, [mMetalDevice maxBufferLength] / 16);
+        if (offsetAlignment > 0 && offsetAlignment <= 256 && maxTextureBufferSize >= 65536)
+        {
+            mNativeExtensions.textureBufferEXT = true;
+            mNativeExtensions.textureBufferOES = true;
+            mNativeCaps.maxTextureBufferSize = static_cast<GLint>(maxTextureBufferSize);
+            mNativeCaps.textureBufferOffsetAlignment = static_cast<GLint>(offsetAlignment);
+        }
+    }
 
     mNativeExtensions.textureShadowLodEXT = true;
 
@@ -1216,6 +1365,10 @@ void DisplayMtl::initializeFeatures()
     {
         return;
     }
+
+    // This feature is intentionally false by default.  The device/version checks in
+    // getMaxSupportedESVersion() remain authoritative even when the feature is overridden.
+    ANGLE_FEATURE_CONDITION((&mFeatures), enableExperimentalGles31, false);
 
     ANGLE_FEATURE_CONDITION((&mFeatures), allowGenMultipleMipsPerPass, true);
 

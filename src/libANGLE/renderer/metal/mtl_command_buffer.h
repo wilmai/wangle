@@ -283,6 +283,7 @@ class CommandEncoder : public WrappedObject<id<MTLCommandEncoder>>, angle::NonCo
     Type getType() const { return mType; }
 
     CommandEncoder &markResourceBeingWrittenByGPU(const BufferRef &buffer);
+    CommandEncoder &markResourceBeingReadByGPU(const BufferRef &buffer);
     CommandEncoder &markResourceBeingWrittenByGPU(const TextureRef &texture);
 
     void insertDebugSignpost(NSString *label);
@@ -384,7 +385,7 @@ struct RenderCommandEncoderShaderStates
     std::array<size_t, kMaxShaderBuffers> bufferOffsets;
     std::array<id<MTLSamplerState>, kMaxShaderSamplers> samplers;
     std::array<Optional<std::pair<float, float>>, kMaxShaderSamplers> samplerLodClamps;
-    std::array<id<MTLTexture>, kMaxShaderSamplers> textures;
+    std::array<id<MTLTexture>, kMaxShaderTextureBindings> textures;
 };
 
 // Per render pass's states
@@ -733,6 +734,8 @@ class ComputeCommandEncoder final : public CommandEncoder
     ComputeCommandEncoder &setBufferForWrite(const BufferRef &buffer,
                                              size_t offset,
                                              uint32_t index);
+    ComputeCommandEncoder &useResource(const BufferRef &resource, MTLResourceUsage usage);
+    ComputeCommandEncoder &useResource(const TextureRef &resource, MTLResourceUsage usage);
     ComputeCommandEncoder &setBytes(const void *bytes, size_t size, uint32_t index);
     template <typename T>
     ComputeCommandEncoder &setData(const T &data, uint32_t index)
@@ -748,6 +751,10 @@ class ComputeCommandEncoder final : public CommandEncoder
 
     ComputeCommandEncoder &dispatch(const MTLSize &threadGroupsPerGrid,
                                     const MTLSize &threadsPerGroup);
+
+    ComputeCommandEncoder &dispatchIndirect(const BufferRef &indirectBuffer,
+                                            size_t indirectBufferOffset,
+                                            const MTLSize &threadsPerGroup);
 
     ComputeCommandEncoder &dispatchNonUniform(const MTLSize &threadsPerGrid,
                                               const MTLSize &threadsPerGroup);

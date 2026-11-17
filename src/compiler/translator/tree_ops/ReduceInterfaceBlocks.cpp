@@ -55,6 +55,10 @@ class Reducer : public TIntermRebuild
                     *new TStructure(&mSymbolTable, interfaceBlock->name(),
                                     &interfaceBlock->fields(), interfaceBlock->symbolType());
                 structure.setImplementingInterfaceBlock();
+                if (type.getQualifier() == TQualifier::EvqBuffer)
+                {
+                    structure.setImplementingShaderStorageBlock();
+                }
                 auto &structVar = CreateStructTypeVariable(mSymbolTable, structure);
                 auto &instanceVar =
                     CreateInstanceVariable(mSymbolTable, structure, newInstanceVarName,
@@ -66,7 +70,8 @@ class Reducer : public TIntermRebuild
                 }
                 else
                 {
-                    ASSERT(type.getQualifier() == TQualifier::EvqUniform);
+                    ASSERT(type.getQualifier() == TQualifier::EvqUniform ||
+                           type.getQualifier() == TQualifier::EvqBuffer);
                     mInstanceMap[&var] = &instanceVar;
                 }
 
@@ -115,7 +120,6 @@ bool sh::ReduceInterfaceBlocks(TCompiler &compiler,
     {
         return false;
     }
-
     if (!SeparateDeclarations(compiler, root, false))
     {
         return false;

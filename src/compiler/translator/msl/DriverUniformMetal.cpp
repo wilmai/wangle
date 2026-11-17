@@ -22,7 +22,9 @@ namespace
 constexpr const char kXfbBufferOffsets[]       = "xfbBufferOffsets";
 constexpr const char kXfbVerticesPerInstance[] = "xfbVerticesPerInstance";
 constexpr const char kCoverageMask[]           = "coverageMask";
-constexpr const char kUnused[]                 = "unused";
+constexpr const char kXfbReplayVertexOffset[]  = "xfbReplayVertexOffset";
+constexpr const char kXfbReplayEnabled[]       = "xfbReplayEnabled";
+constexpr const char kImageLayers[]            = "imageLayers";
 
 }  // namespace
 
@@ -32,10 +34,11 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
 {
     TFieldList *driverFieldList = DriverUniform::createUniformFields(symbolTable);
 
-    constexpr size_t kNumGraphicsDriverUniformsMetal = 4;
+    constexpr size_t kNumGraphicsDriverUniformsMetal = 5;
     constexpr std::array<const char *, kNumGraphicsDriverUniformsMetal>
-        kGraphicsDriverUniformNamesMetal = {
-            {kXfbBufferOffsets, kXfbVerticesPerInstance, kCoverageMask, kUnused}};
+        kGraphicsDriverUniformNamesMetal = {{kXfbBufferOffsets, kXfbVerticesPerInstance,
+                                             kCoverageMask, kXfbReplayVertexOffset,
+                                             kXfbReplayEnabled}};
 
     const std::array<TType *, kNumGraphicsDriverUniformsMetal> kDriverUniformTypesMetal = {{
         // xfbBufferOffsets: uvec4
@@ -44,8 +47,10 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
         new TType(EbtInt, EbpHigh, EvqGlobal),
         // coverageMask: uint
         new TType(EbtUInt, EbpHigh, EvqGlobal),
-        // unused: uvec2
-        new TType(EbtUInt, EbpHigh, EvqGlobal, 2),
+        // xfbReplayVertexOffset: int
+        new TType(EbtInt, EbpHigh, EvqGlobal),
+        // xfbReplayEnabled: uint
+        new TType(EbtUInt, EbpHigh, EvqGlobal),
     }};
 
     for (size_t uniformIndex = 0; uniformIndex < kNumGraphicsDriverUniformsMetal; ++uniformIndex)
@@ -57,12 +62,22 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
         driverFieldList->push_back(driverUniformField);
     }
 
+    TType *imageLayersType = new TType(EbtUInt, EbpHigh, EvqGlobal);
+    imageLayersType->makeArray(8);
+    driverFieldList->push_back(new TField(imageLayersType, ImmutableString(kImageLayers),
+                                          TSourceLoc(), SymbolType::AngleInternal));
+
     return driverFieldList;
 }
 
 TIntermTyped *DriverUniformMetal::getCoverageMaskField() const
 {
     return createDriverUniformRef(kCoverageMask);
+}
+
+TIntermTyped *DriverUniformMetal::getImageLayersField() const
+{
+    return createDriverUniformRef(kImageLayers);
 }
 
 }  // namespace sh

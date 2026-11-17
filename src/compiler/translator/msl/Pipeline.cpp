@@ -11,6 +11,32 @@ using namespace sh;
 
 ////////////////////////////////////////////////////////////////////////////////
 
+namespace
+{
+bool IsShaderStorageBlock(const TVariable &var)
+{
+    const TStructure *structure = var.getType().getStruct();
+    if (!structure)
+    {
+        return false;
+    }
+
+    if (structure->isImplementingShaderStorageBlock())
+    {
+        return true;
+    }
+
+    for (const TField *field : structure->fields())
+    {
+        if (field->type()->getQualifier() == TQualifier::EvqBuffer)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
 #define VARIANT_NAME(variant, base) (variant == Variant::Modified ? base "Mod" : base)
 
 bool Pipeline::uses(const TVariable &var) const
@@ -145,7 +171,16 @@ bool Pipeline::uses(const TVariable &var) const
             switch (qualifier)
             {
                 case TQualifier::EvqBuffer:
-                    return true;
+                    return !IsShaderStorageBlock(var);
+                default:
+                    return false;
+            }
+
+        case Type::StorageBuffer:
+            switch (qualifier)
+            {
+                case TQualifier::EvqBuffer:
+                    return IsShaderStorageBlock(var);
                 default:
                     return false;
             }
@@ -207,6 +242,10 @@ Name Pipeline::getStructTypeName(Variant variant) const
             break;
         case Type::UniformBuffer:
             name = VARIANT_NAME(variant, "UniformBuffer");
+            break;
+        case Type::StorageBuffer:
+            name = VARIANT_NAME(variant, "StorageBuffer");
+            break;
     }
     return Name(name);
 }
@@ -257,6 +296,10 @@ Name Pipeline::getStructInstanceName(Variant variant) const
             break;
         case Type::UniformBuffer:
             name = VARIANT_NAME(variant, "uniformBuffer");
+            break;
+        case Type::StorageBuffer:
+            name = VARIANT_NAME(variant, "storageBuffer");
+            break;
     }
     return Name(name);
 }
@@ -287,6 +330,7 @@ static bool AllowPadding(Pipeline::Type type)
         case Type::Image:
         case Type::InstanceId:
         case Type::UniformBuffer:
+        case Type::StorageBuffer:
             return false;
     }
 }
@@ -413,6 +457,12 @@ ModifyStructConfig Pipeline::externalStructModifyConfig() const
             config.saturateScalarOrVectorArrays = SatVec::DontSaturate;
             config.recurseStruct                = Pred::True;
             break;
+        case Type::StorageBuffer:
+            config.promoteBoolToUint            = Pred::False;
+            config.saturateMatrixRows           = SatVec::DontSaturate;
+            config.saturateScalarOrVectorArrays = SatVec::DontSaturate;
+            config.recurseStruct                = Pred::False;
+            break;
         case Type::InvocationVertexGlobals:
         case Type::InvocationFragmentGlobals:
         case Type::Texture:
@@ -444,6 +494,8 @@ bool Pipeline::alwaysRequiresLocalVariableDeclarationInMain() const
         case Type::Texture:
         case Type::InstanceId:
             return true;
+        case Type::StorageBuffer:
+            return false;
     }
 }
 
@@ -462,6 +514,7 @@ bool Pipeline::isPipelineOut() const
         case Type::Image:
         case Type::InstanceId:
         case Type::UniformBuffer:
+        case Type::StorageBuffer:
             return false;
 
         case Type::VertexOut:
@@ -490,6 +543,9 @@ AddressSpace Pipeline::externalAddressSpace() const
         case Type::AngleUniforms:
         case Type::UniformBuffer:
             return AddressSpace::Constant;
+
+        case Type::StorageBuffer:
+            return AddressSpace::Device;
     }
 }
 
@@ -506,7 +562,9 @@ bool PipelineStructs::matches(const TStructure &s, bool internal, bool external)
         invocationVertexGlobals,
         invocationFragmentGlobals,
         uniformBuffers,
+        storageBuffers,
         texture,
+        image,
         instanceId,
     };
     for (const auto &p : ps)

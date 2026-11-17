@@ -11,6 +11,7 @@
 
 #include <TargetConditionals.h>
 #include <cstdint>
+#include <limits>
 
 #include "GLSLANG/ShaderLang.h"
 #include "common/debug.h"
@@ -19,6 +20,8 @@
 #include "libANGLE/Display.h"
 #include "libANGLE/Query.h"
 #include "libANGLE/TransformFeedback.h"
+#include "libANGLE/Uniform.h"
+#include "libANGLE/renderer/ProgramPipelineImpl.h"
 #include "libANGLE/renderer/metal/BufferMtl.h"
 #include "libANGLE/renderer/metal/CompilerMtl.h"
 #include "libANGLE/renderer/metal/DisplayMtl.h"
@@ -54,30 +57,119 @@ constexpr uint32_t kMaxTriFanLineLoopBuffersPerFrame = 0;
 constexpr uint32_t kMaxTriFanLineLoopBuffersPerFrame = 10;
 #endif
 
-#define ANGLE_MTL_XFB_DRAW(DRAW_PROC)                                                       \
-    if (!mState.isTransformFeedbackActiveUnpaused())                                        \
-    {                                                                                       \
-        /* Normal draw call */                                                              \
-        DRAW_PROC(false);                                                                   \
-    }                                                                                       \
-    else                                                                                    \
-    {                                                                                       \
-        /* First pass: write to XFB buffers in vertex shader, fragment shader inactive */   \
-        bool rasterizationEnabled = mRenderPipelineDesc.getRasterizationType() !=           \
-                                    mtl::RenderPipelineRasterization::Disabled;             \
-        if (rasterizationEnabled)                                                           \
-        {                                                                                   \
-            invalidateRenderPipeline();                                                     \
-        }                                                                                   \
-        DRAW_PROC(true);                                                                    \
-        if (rasterizationEnabled)                                                           \
-        {                                                                                   \
-            /* Second pass: full rasterization: vertex shader + fragment shader are active. \
-               Vertex shader writes to stage output but won't write to XFB buffers */       \
-            invalidateRenderPipeline();                                                     \
-            DRAW_PROC(false);                                                               \
-        }                                                                                   \
+constexpr size_t kXfbReplayBuiltInOutputSize = 128;
+
+bool GetXfbReplayVariableSize(const sh::ShaderVariable &variable, size_t *sizeOut)
+{
+    constexpr size_t kRecordAlignment = 16;
+    auto alignRecordSize              = [](size_t size) {
+        return (size + kRecordAlignment - 1) & ~(kRecordAlignment - 1);
+    };
+
+    size_t elementSize = 0;
+    if (variable.isStruct())
+    {
+        for (const sh::ShaderVariable &field : variable.fields)
+        {
+            size_t fieldSize = 0;
+            if (!GetXfbReplayVariableSize(field, &fieldSize) ||
+                fieldSize > std::numeric_limits<size_t>::max() - elementSize)
+            {
+                return false;
+            }
+            elementSize = alignRecordSize(elementSize) + fieldSize;
+        }
     }
+    else
+    {
+        const gl::UniformTypeInfo &typeInfo = gl::GetUniformTypeInfo(variable.type);
+        const size_t rowSize                = alignRecordSize(typeInfo.rowCount * sizeof(uint32_t));
+        if (typeInfo.columnCount != 0 &&
+            rowSize > std::numeric_limits<size_t>::max() / typeInfo.columnCount)
+        {
+            return false;
+        }
+        elementSize = rowSize * typeInfo.columnCount;
+    }
+
+    const size_t arraySize = std::max(1u, variable.getArraySizeProduct());
+    if (elementSize != 0 && arraySize > std::numeric_limits<size_t>::max() / elementSize)
+    {
+        return false;
+    }
+    *sizeOut = alignRecordSize(elementSize) * arraySize;
+    return true;
+}
+
+bool GetXfbReplayRecordSize(const gl::ProgramExecutable &executable, size_t *sizeOut)
+{
+    size_t size = kXfbReplayBuiltInOutputSize;
+    for (const sh::ShaderVariable &varying :
+         executable.getLinkedOutputVaryings(gl::ShaderType::Vertex))
+    {
+        size_t varyingSize = 0;
+        if (!GetXfbReplayVariableSize(varying, &varyingSize) ||
+            varyingSize > std::numeric_limits<size_t>::max() - size)
+        {
+            return false;
+        }
+        size = (size + 15) & ~size_t(15);
+        size += varyingSize;
+    }
+    *sizeOut = (size + 15) & ~size_t(15);
+    return true;
+}
+
+#define ANGLE_MTL_XFB_DRAW(DRAW_PROC, REPLAY_ELIGIBLE)                                          \
+    if (!mState.isTransformFeedbackActiveUnpaused())                                            \
+    {                                                                                           \
+        /* Normal draw call */                                                                  \
+        DRAW_PROC(false);                                                                       \
+    }                                                                                           \
+    else                                                                                        \
+    {                                                                                           \
+        const gl::ProgramExecutable *executable = mState.getProgramExecutable();                \
+        const bool replayEnabled = (REPLAY_ELIGIBLE) && !mState.isRasterizerDiscardEnabled() && \
+                                   executable && executable->hasTransformFeedbackOutput();      \
+        ScopedXfbReplayState replayState(this, replayEnabled);                                  \
+        /* First pass: write to XFB buffers in vertex shader, fragment shader inactive */       \
+        bool rasterizationEnabled = !mState.isRasterizerDiscardEnabled();                       \
+        if (rasterizationEnabled)                                                               \
+        {                                                                                       \
+            invalidateRenderPipeline();                                                         \
+        }                                                                                       \
+        DRAW_PROC(true);                                                                        \
+        if (rasterizationEnabled)                                                               \
+        {                                                                                       \
+            /* Second pass: full rasterization: vertex shader + fragment shader are active.     \
+               Vertex shader writes to stage output but won't write to XFB buffers */           \
+            if (replayEnabled)                                                                  \
+            {                                                                                   \
+                /* Make capture-buffer writes visible to the replay vertex shader. */           \
+                mRenderEncoder.memoryBarrierWithResource(                                       \
+                    mXfbReplayBuffer.buffer(), MTLRenderStageVertex, MTLRenderStageVertex);      \
+            }                                                                                   \
+            invalidateRenderPipeline();                                                         \
+            replayState.setReplayPass(replayEnabled);                                           \
+            DRAW_PROC(false);                                                                   \
+        }                                                                                       \
+    }
+
+class ScopedXfbReplayState
+{
+  public:
+    ScopedXfbReplayState(ContextMtl *context, bool replayEnabled) : mContext(context)
+    {
+        mContext->setXfbReplayEnabled(replayEnabled);
+    }
+
+    ~ScopedXfbReplayState() { mContext->resetXfbReplayState(); }
+
+    void setReplayPass(bool replayPass) { mContext->setXfbReplayPass(replayPass); }
+
+  private:
+    ContextMtl *mContext;
+};
 
 angle::Result AllocateTriangleFanBufferFromPool(ContextMtl *context,
                                                 GLsizei vertexCount,
@@ -240,6 +332,7 @@ angle::Result ContextMtl::initialize(const angle::ImageLoadContext &imageLoadCon
     mLineLoopLastSegmentIndexBuffer.initialize(
         this, 2 * sizeof(uint32_t), mtl::kIndexBufferOffsetAlignment,
         kMaxTriFanLineLoopBuffersPerFrame, mtl::TrackBufferInContext::Yes);
+    mXfbReplayBufferPool.initialize(this, 0, 16, 0, mtl::TrackBufferInContext::Yes);
 
     mContextDevice.set(mDisplay->getMetalDevice());
 
@@ -529,7 +622,7 @@ angle::Result ContextMtl::drawArraysImpl(const gl::Context *context,
         }                                                                                          \
     }
 
-    ANGLE_MTL_XFB_DRAW(DRAW_GENERIC_ARRAY)
+    ANGLE_MTL_XFB_DRAW(DRAW_GENERIC_ARRAY, true)
 
     return angle::Result::Continue;
 }
@@ -772,7 +865,9 @@ angle::Result ContextMtl::drawArraysProvokingVertexImpl(const gl::Context *conte
         }                                                                                          \
     }
 
-    ANGLE_MTL_XFB_DRAW(DRAW_PROVOKING_VERTEX_ARRAY)
+    // The generated indices retain the original drawArrays vertex IDs.  The replay shader uses
+    // those IDs to read the per-vertex outputs captured by the non-indexed first pass.
+    ANGLE_MTL_XFB_DRAW(DRAW_PROVOKING_VERTEX_ARRAY, true)
     return angle::Result::Continue;
 }
 
@@ -953,18 +1048,64 @@ angle::Result ContextMtl::drawArraysIndirect(const gl::Context *context,
                                              gl::PrimitiveMode mode,
                                              const void *indirect)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return angle::Result::Stop;
+    gl::Buffer *drawIndirectBuffer =
+        context->getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
+    ASSERT(drawIndirectBuffer);
+    BufferMtl *bufferMtl = mtl::GetImpl(drawIndirectBuffer);
+    const size_t offset  = reinterpret_cast<uintptr_t>(indirect);
+    const angle::Span<const uint8_t> commandData =
+        bufferMtl->getBufferDataReadOnly(mtl::GetImpl(context), offset);
+    if (commandData.size() < sizeof(gl::DrawArraysIndirectCommand))
+    {
+        return angle::Result::Stop;
+    }
+
+    gl::DrawArraysIndirectCommand command;
+    std::memcpy(&command, commandData.data(), sizeof(command));
+    if (command.count == 0 || command.instanceCount == 0)
+    {
+        return angle::Result::Continue;
+    }
+
+    if (command.instanceCount == 1 && command.baseInstance == 0)
+    {
+        return drawArrays(context, mode, static_cast<GLint>(command.first),
+                          static_cast<GLsizei>(command.count));
+    }
+    return drawArraysInstancedBaseInstance(
+        context, mode, static_cast<GLint>(command.first), static_cast<GLsizei>(command.count),
+        static_cast<GLsizei>(command.instanceCount), command.baseInstance);
 }
 angle::Result ContextMtl::drawElementsIndirect(const gl::Context *context,
                                                gl::PrimitiveMode mode,
                                                gl::DrawElementsType type,
                                                const void *indirect)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return angle::Result::Stop;
+    gl::Buffer *drawIndirectBuffer =
+        context->getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
+    ASSERT(drawIndirectBuffer);
+    BufferMtl *bufferMtl = mtl::GetImpl(drawIndirectBuffer);
+    const size_t offset  = reinterpret_cast<uintptr_t>(indirect);
+    const angle::Span<const uint8_t> commandData =
+        bufferMtl->getBufferDataReadOnly(mtl::GetImpl(context), offset);
+    if (commandData.size() < sizeof(gl::DrawElementsIndirectCommand))
+    {
+        return angle::Result::Stop;
+    }
+
+    gl::DrawElementsIndirectCommand command;
+    std::memcpy(&command, commandData.data(), sizeof(command));
+    if (command.count == 0 || command.primCount == 0)
+    {
+        return angle::Result::Continue;
+    }
+
+    const size_t indexOffset =
+        static_cast<size_t>(command.firstIndex) * gl::GetDrawElementsTypeSize(type);
+    const void *indices = reinterpret_cast<const void *>(indexOffset);
+    return drawElementsInstancedBaseVertexBaseInstance(
+        context, mode, static_cast<GLsizei>(command.count), type, indices,
+        static_cast<GLsizei>(command.primCount), command.baseVertex, command.baseInstance);
 }
 
 angle::Result ContextMtl::multiDrawArrays(const gl::Context *context,
@@ -1339,8 +1480,8 @@ angle::Result ContextMtl::syncState(const gl::Context *context,
             case gl::state::DIRTY_BIT_ATOMIC_COUNTER_BUFFER_BINDING:
                 break;
             case gl::state::DIRTY_BIT_IMAGE_BINDINGS:
-                // NOTE(hqle): properly handle GLSL images.
                 invalidateCurrentTextures();
+                invalidateDriverUniforms();
                 break;
             case gl::state::DIRTY_BIT_MULTISAMPLING:
                 // NOTE(hqle): MSAA on/off.
@@ -1551,10 +1692,28 @@ SamplerImpl *ContextMtl::createSampler(const gl::SamplerState &state)
 // Program Pipeline object creation
 ProgramPipelineImpl *ContextMtl::createProgramPipeline(const gl::ProgramPipelineState &data)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return nullptr;
+    return new ProgramPipelineImpl(data);
 }
+
+namespace
+{
+ProgramExecutableMtl *GetComputeProgramExecutable(const gl::ProgramExecutable *executable)
+{
+    if (!executable)
+    {
+        return nullptr;
+    }
+
+    if (executable->IsPPO())
+    {
+        const gl::SharedProgramExecutable &computeExecutable =
+            executable->getPPOProgramExecutables()[gl::ShaderType::Compute];
+        return computeExecutable ? mtl::GetImpl(computeExecutable.get()) : nullptr;
+    }
+
+    return mtl::GetImpl(executable);
+}
+}  // namespace
 
 // Memory object creation.
 MemoryObjectImpl *ContextMtl::createMemoryObject()
@@ -1575,15 +1734,74 @@ angle::Result ContextMtl::dispatchCompute(const gl::Context *context,
                                           GLuint numGroupsY,
                                           GLuint numGroupsZ)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return angle::Result::Stop;
+    const gl::Caps &caps = context->getCaps();
+    if (numGroupsX > static_cast<GLuint>(caps.maxComputeWorkGroupCount[0]) ||
+        numGroupsY > static_cast<GLuint>(caps.maxComputeWorkGroupCount[1]) ||
+        numGroupsZ > static_cast<GLuint>(caps.maxComputeWorkGroupCount[2]))
+    {
+        handleError(GL_INVALID_VALUE, "Compute dispatch exceeds the Metal GLES 3.1 limits.",
+                    __FILE__, ANGLE_FUNCTION, __LINE__);
+        return angle::Result::Stop;
+    }
+
+    ProgramExecutableMtl *computeExecutable =
+        GetComputeProgramExecutable(context->getState().getProgramExecutable());
+    if (!computeExecutable)
+    {
+        handleError(GL_INVALID_OPERATION, "No compute program is active.", __FILE__, ANGLE_FUNCTION,
+                    __LINE__);
+        return angle::Result::Stop;
+    }
+
+    mtl::ComputeCommandEncoder *computeEncoder = getComputeCommandEncoder();
+    ANGLE_TRY(computeExecutable->setupCompute(context, computeEncoder));
+
+    const gl::ProgramExecutable *computeProgramExecutable =
+        context->getState().getProgramExecutable();
+    if (computeProgramExecutable->IsPPO())
+    {
+        computeProgramExecutable =
+            computeProgramExecutable->getPPOProgramExecutables()[gl::ShaderType::Compute].get();
+    }
+    ASSERT(computeProgramExecutable);
+    const sh::WorkGroupSize &localSize = computeProgramExecutable->getComputeShaderLocalSize();
+    computeEncoder->dispatch(MTLSizeMake(numGroupsX, numGroupsY, numGroupsZ),
+                             MTLSizeMake(localSize[0], localSize[1], localSize[2]));
+    return angle::Result::Continue;
 }
 angle::Result ContextMtl::dispatchComputeIndirect(const gl::Context *context, GLintptr indirect)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return angle::Result::Stop;
+    ProgramExecutableMtl *computeExecutable =
+        GetComputeProgramExecutable(context->getState().getProgramExecutable());
+    if (!computeExecutable)
+    {
+        handleError(GL_INVALID_OPERATION, "No compute program is active.", __FILE__, ANGLE_FUNCTION,
+                    __LINE__);
+        return angle::Result::Stop;
+    }
+
+    gl::Buffer *indirectBuffer =
+        context->getState().getTargetBuffer(gl::BufferBinding::DispatchIndirect);
+    ASSERT(indirectBuffer);
+    BufferMtl *indirectBufferMtl = mtl::GetImpl(indirectBuffer);
+    mtl::BufferRef metalBuffer   = indirectBufferMtl->getCurrentBuffer();
+    ASSERT(metalBuffer);
+
+    mtl::ComputeCommandEncoder *computeEncoder = getComputeCommandEncoder();
+    ANGLE_TRY(computeExecutable->setupCompute(context, computeEncoder));
+
+    const gl::ProgramExecutable *computeProgramExecutable =
+        context->getState().getProgramExecutable();
+    if (computeProgramExecutable->IsPPO())
+    {
+        computeProgramExecutable =
+            computeProgramExecutable->getPPOProgramExecutables()[gl::ShaderType::Compute].get();
+    }
+    ASSERT(computeProgramExecutable);
+    const sh::WorkGroupSize &localSize = computeProgramExecutable->getComputeShaderLocalSize();
+    computeEncoder->dispatchIndirect(metalBuffer, static_cast<size_t>(indirect),
+                                     MTLSizeMake(localSize[0], localSize[1], localSize[2]));
+    return angle::Result::Continue;
 }
 
 angle::Result ContextMtl::memoryBarrier(const gl::Context *context, GLbitfield barriers)
@@ -1594,9 +1812,11 @@ angle::Result ContextMtl::memoryBarrier(const gl::Context *context, GLbitfield b
     }
     if (context->getClientVersion() >= gl::Version{3, 1})
     {
-        // We expect ES 3.0, and as such we don't consider ES 3.1+ objects in this function yet.
-        UNIMPLEMENTED();
-        return angle::Result::Stop;
+        // A Metal encoder boundary provides a stronger ordering guarantee than each GLES barrier
+        // bit requires.  It also handles compute-to-render, compute-to-blit, and readback hazards
+        // uniformly across GPU families with different render-stage barrier support.
+        endEncoding(false);
+        return checkCommandBufferError();
     }
     MTLBarrierScope scope;
     switch (barriers)
@@ -1644,8 +1864,16 @@ angle::Result ContextMtl::memoryBarrier(const gl::Context *context, GLbitfield b
 
 angle::Result ContextMtl::memoryBarrierByRegion(const gl::Context *context, GLbitfield barriers)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
+    if (context->getClientVersion() >= gl::Version{3, 1})
+    {
+        // Metal has no framebuffer-region equivalent for this compute-focused profile.  A full
+        // encoder boundary is conservative and preserves the required ordering.
+        endEncoding(false);
+        return checkCommandBufferError();
+    }
+
+    handleError(GL_INVALID_OPERATION, "memoryBarrierByRegion requires GLES 3.1.", __FILE__,
+                ANGLE_FUNCTION, __LINE__);
     return angle::Result::Stop;
 }
 
@@ -1768,7 +1996,20 @@ angle::Result ContextMtl::getIncompleteTexture(const gl::Context *context,
                                                gl::SamplerFormat format,
                                                gl::Texture **textureOut)
 {
-    return mIncompleteTextures.getIncompleteTexture(context, type, format, nullptr, textureOut);
+    return mIncompleteTextures.getIncompleteTexture(context, type, format, this, textureOut);
+}
+
+angle::Result ContextMtl::initializeMultisampleTextureToBlack(const gl::Context *context,
+                                                              gl::Texture *glTexture)
+{
+    const gl::TextureType type = glTexture->getType();
+    ASSERT(type == gl::TextureType::_2DMultisample || type == gl::TextureType::_2DMultisampleArray);
+
+    TextureMtl *textureMtl          = mtl::GetImpl(glTexture);
+    const gl::ImageIndex imageIndex = type == gl::TextureType::_2DMultisample
+                                          ? gl::ImageIndex::Make2DMultisample()
+                                          : gl::ImageIndex::Make2DMultisampleArray();
+    return textureMtl->initializeContents(context, GL_NONE, imageIndex);
 }
 
 void ContextMtl::endBlitAndComputeEncoding()
@@ -2452,15 +2693,14 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
     {
         return angle::Result::Continue;
     }
-    if (!mRenderEncoder.valid())
+
+    if (!mRenderEncoder.valid() || mDirtyBits.any())
     {
-        // Flush occurred during setup, due to running out of memory while setting up the render
-        // pass state. This would happen for example when there is no more space in the uniform
-        // buffers in the uniform buffer pool. The rendering would be flushed to free the uniform
-        // buffer memory for new usage. In this case, re-run the setup.
+        // Setup can start a new render pass, for example when initializing an incomplete
+        // multisample texture. Reapply state to the new encoder before issuing the draw.
+        // A flush can also invalidate the encoder while setting up the render pass.
         ANGLE_TRY(setupDrawImpl(context, firstVertex, vertexOrIndexCount, instances,
                                 indexTypeOrNone, indices, xfbPass, isNoOp));
-
         if (*isNoOp)
         {
             return checkCommandBufferError();
@@ -2468,6 +2708,7 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
         // Setup with flushed state should either produce a working encoder or fail with an error
         // result.
         ASSERT(mRenderEncoder.valid());
+        ASSERT(mDirtyBits.none());
     }
     return angle::Result::Continue;
 }
@@ -2485,6 +2726,37 @@ angle::Result ContextMtl::setupDrawImpl(const gl::Context *context,
     *isNoOp = false;
     // instances=0 means no instanced draw.
     GLsizei instanceCount = instances ? instances : 1;
+
+    if (xfbPass)
+    {
+        size_t replayBufferSize = sizeof(uint32_t) * 4;
+        if (mXfbReplayEnabled)
+        {
+            size_t recordSize = 0;
+            if (!GetXfbReplayRecordSize(*mState.getProgramExecutable(), &recordSize))
+            {
+                ANGLE_CHECK_GL_ALLOC(this, false);
+                return angle::Result::Stop;
+            }
+
+            const size_t vertexCount   = static_cast<size_t>(vertexOrIndexCount);
+            const size_t instanceTotal = static_cast<size_t>(instanceCount);
+            if ((vertexCount != 0 &&
+                 recordSize > std::numeric_limits<size_t>::max() / vertexCount) ||
+                vertexCount * recordSize > std::numeric_limits<size_t>::max() / instanceTotal)
+            {
+                ANGLE_CHECK_GL_ALLOC(this, false);
+                return angle::Result::Stop;
+            }
+            // Incomplete independent primitives can be rounded down to zero vertices before
+            // reaching setupDrawImpl. Keep a valid pool allocation for that no-op draw path.
+            replayBufferSize =
+                std::max(replayBufferSize, vertexCount * recordSize * instanceTotal);
+        }
+
+        ANGLE_TRY(mXfbReplayBufferPool.allocate(this, replayBufferSize, &mXfbReplayBuffer));
+        ANGLE_TRY(mXfbReplayBufferPool.commit(this));
+    }
 
     if (context->hasAnyActiveClientAttrib())
     {
@@ -2639,6 +2911,13 @@ angle::Result ContextMtl::setupDrawImpl(const gl::Context *context,
                                          uniformBuffersDirty));
     }
 
+    if (!*isNoOp && (xfbPass || mXfbReplayPass))
+    {
+        ASSERT(mXfbReplayBuffer.buffer());
+        mRenderEncoder.setVertexBuffer(mXfbReplayBuffer.buffer(), mXfbReplayBuffer.offset(),
+                                       mtl::kSSBOArgumentBufferBindingIndex + 1);
+    }
+
     return checkCommandBufferError();
 }
 
@@ -2706,6 +2985,12 @@ angle::Result ContextMtl::handleDirtyActiveTextures(const gl::Context *context)
         {
             return angle::Result::Continue;
         }
+        if (texture->getType() == gl::TextureType::Buffer)
+        {
+            // Buffer texture storage is exposed through a view of its bound MTLBuffer and has no
+            // ordinary image storage to create or upload.
+            return angle::Result::Continue;
+        }
 
         TextureMtl *textureMtl = mtl::GetImpl(texture);
 
@@ -2752,6 +3037,18 @@ angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context,
                                                     GLint drawCallFirstVertex,
                                                     uint32_t verticesPerInstance)
 {
+    std::fill(std::begin(mDriverUniforms.imageLayers), std::end(mDriverUniforms.imageLayers),
+              0xFFFFFFFFu);
+    for (uint32_t imageIndex = 0; imageIndex < mState.getImageUnits().size(); ++imageIndex)
+    {
+        const gl::ImageUnit &imageUnit = mState.getImageUnit(imageIndex);
+        if (imageUnit.texture.get() != nullptr && !imageUnit.layered &&
+            imageUnit.texture->getType() == gl::TextureType::_3D)
+        {
+            mDriverUniforms.imageLayers[imageIndex] = static_cast<uint32_t>(imageUnit.layer);
+        }
+    }
+
     mDriverUniforms.depthRange[0] = mState.getNearPlane();
     mDriverUniforms.depthRange[1] = mState.getFarPlane();
 
@@ -2829,6 +3126,8 @@ angle::Result ContextMtl::fillDriverXFBUniforms(GLint drawCallFirstVertex,
     }
 
     mDriverUniforms.xfbVerticesPerInstance = verticesPerInstance;
+    mDriverUniforms.xfbReplayVertexOffset  = drawCallFirstVertex;
+    mDriverUniforms.xfbReplayEnabled       = mXfbReplayEnabled ? 1u : 0u;
 
     TransformFeedbackMtl *transformFeedbackMtl = mtl::GetImpl(transformFeedback);
 

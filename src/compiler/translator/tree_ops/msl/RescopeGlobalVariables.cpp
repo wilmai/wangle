@@ -4,9 +4,11 @@
 // found in the LICENSE file.
 //
 
+#include <algorithm>
 #include <set>
 
 #include "compiler/translator/tree_ops/msl/RescopeGlobalVariables.h"
+#include "compiler/translator/tree_util/FindMain.h"
 #include "compiler/translator/tree_util/IntermTraverse.h"
 #include "compiler/translator/tree_util/ReplaceVariable.h"
 #include "compiler/translator/util.h"
@@ -18,6 +20,54 @@ namespace sh
 
 namespace
 {
+
+void InlineGlobalInitializers(TIntermBlock &root)
+{
+    TIntermFunctionDefinition *initGlobals = nullptr;
+    for (TIntermNode *node : *root.getSequence())
+    {
+        TIntermFunctionDefinition *function = node->getAsFunctionDefinition();
+        if (function && function->getFunction()->symbolType() == SymbolType::AngleInternal &&
+            function->getFunction()->name() == "initGlobals")
+        {
+            initGlobals = function;
+            break;
+        }
+    }
+
+    if (!initGlobals)
+    {
+        return;
+    }
+
+    TIntermBlock *mainBody = FindMainBody(&root);
+    ASSERT(mainBody);
+    TIntermSequence &mainSequence = *mainBody->getSequence();
+    auto call = std::find_if(mainSequence.begin(), mainSequence.end(), [&](TIntermNode *node) {
+        TIntermAggregate *aggregate = node->getAsAggregate();
+        return aggregate && aggregate->getFunction() == initGlobals->getFunction();
+    });
+    if (call == mainSequence.end())
+    {
+        return;
+    }
+
+    TIntermSequence &initializerSequence = *initGlobals->getBody()->getSequence();
+    call = mainSequence.erase(call);
+    mainSequence.insert(call, initializerSequence.begin(), initializerSequence.end());
+
+    TIntermSequence &rootSequence = *root.getSequence();
+    rootSequence.erase(std::remove_if(rootSequence.begin(), rootSequence.end(), [&](TIntermNode *node) {
+                           TIntermFunctionDefinition *function = node->getAsFunctionDefinition();
+                           if (function == initGlobals)
+                           {
+                               return true;
+                           }
+                           TIntermFunctionPrototype *prototype = node->getAsFunctionPrototypeNode();
+                           return prototype && prototype == initGlobals->getFunctionPrototype();
+                       }),
+                       rootSequence.end());
+}
 
 class Rescoper : public TIntermTraverser
 {
@@ -160,6 +210,8 @@ class Rescoper : public TIntermTraverser
 
 bool RescopeGlobalVariables(TCompiler &compiler, TIntermBlock &root)
 {
+    InlineGlobalInitializers(root);
+
     TSymbolTable &symbolTable = compiler.getSymbolTable();
     Rescoper rescoper(&symbolTable);
     root.traverse(&rescoper);

@@ -53,6 +53,415 @@ class MSLVertexOutputTest : public MSLOutputTestBase
     MSLVertexOutputTest() : MSLOutputTestBase(GL_VERTEX_SHADER) {}
 };
 
+class MSLComputeOutputTest : public MSLOutputTestBase
+{
+  public:
+    MSLComputeOutputTest() : MSLOutputTestBase(GL_COMPUTE_SHADER) {}
+};
+
+TEST_F(MSLComputeOutputTest, KernelInvocationBuiltinsAndBarrier)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+
+        void main()
+        {
+            uint invocation = gl_GlobalInvocationID.x + gl_LocalInvocationID.x;
+            if (invocation == gl_LocalInvocationIndex)
+            {
+                barrier();
+            }
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("kernel void main0("));
+    EXPECT_TRUE(foundInCode("thread_position_in_grid"));
+    EXPECT_TRUE(foundInCode("thread_position_in_threadgroup"));
+    EXPECT_TRUE(foundInCode("ANGLE_barrier"));
+}
+
+TEST_F(MSLComputeOutputTest, ShaderStorageBufferRuntimeArray)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(std430, binding = 0) buffer Data
+        {
+            uint values[];
+        } data;
+
+        void main()
+        {
+            uint count = uint(data.values.length());
+            if (gl_GlobalInvocationID.x < count)
+            {
+                data.values[gl_GlobalInvocationID.x] += 1u;
+            }
+            memoryBarrierBuffer();
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("device"));
+    EXPECT_TRUE(foundInCode("storageBuffer"));
+    EXPECT_TRUE(foundInCode("[[id(0)]]"));
+    EXPECT_TRUE(foundInCode("metal::array<uint, 1> _uvalues;"));
+    EXPECT_TRUE(foundInCode("_length"));
+    EXPECT_TRUE(foundInCode("ANGLE_memoryBarrier"));
+}
+
+TEST_F(MSLComputeOutputTest, ShaderStorageBufferBlockArray)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(std430, binding = 0) buffer Data
+        {
+            uint bias;
+            uint values[];
+        } data[2];
+
+        void main()
+        {
+            if (data[0].values.length() > 0)
+            {
+                data[0].values[0] += data[0].bias;
+            }
+            if (data[1].values.length() > 0)
+            {
+                data[1].values[0] += data[1].bias;
+            }
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::array<device _bData *, 2> _udata"));
+    EXPECT_TRUE(foundInCode("metal::array<constant uint *, 2> _udata_length"));
+    EXPECT_TRUE(foundInCode("_udata_length[0]"));
+    EXPECT_TRUE(foundInCode("_udata_length[1]"));
+}
+
+TEST_F(MSLComputeOutputTest, ArraysOfArrays)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        void main()
+        {
+            float first[2][3] = float[][](float[](1.0, 2.0, 3.0), float[](4.0, 5.0, 6.0));
+            float second[2][3] = float[][](float[](7.0, 8.0, 9.0), float[](10.0, 11.0, 12.0));
+            first = second;
+            vec2 firstVectors[2][2] = vec2[][](vec2[](vec2(1.0, 2.0), vec2(3.0, 4.0)),
+                                                vec2[](vec2(5.0, 6.0), vec2(7.0, 8.0)));
+            vec2 secondVectors[2][2] = vec2[][](vec2[](vec2(9.0, 10.0), vec2(11.0, 12.0)),
+                                                 vec2[](vec2(13.0, 14.0), vec2(15.0, 16.0)));
+            firstVectors = secondVectors;
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::array<metal::array<float, 3>, 2>"));
+    EXPECT_TRUE(foundInCode("metal::array<metal::array<metal::float2, 2>, 2>"))
+        << outputCode(SH_MSL_METAL_OUTPUT);
+    EXPECT_FALSE(foundInCode("metal::array<float, 3, 2>"));
+}
+
+TEST_F(MSLComputeOutputTest, ShaderStorageBufferStd430Vec3AndScalarLayout)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(std430, binding = 0) buffer Result
+        {
+            uvec3 expectedGroupCount;
+            coherent uint numPassed;
+        } result;
+
+        void main()
+        {
+            if (all(equal(result.expectedGroupCount, gl_NumWorkGroups)))
+            {
+                atomicAdd(result.numPassed, 1u);
+            }
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("alignas(16) metal::packed_uint3"));
+    EXPECT_TRUE(foundInCode("uint32_t _unumPassed"));
+}
+
+TEST_F(MSLComputeOutputTest, ShaderStorageBufferMatrixCompoundAssignment)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(std430, binding = 0) buffer Data
+        {
+            mat4 transform;
+        } data;
+        uniform mat4 multiplier;
+
+        void main()
+        {
+            data.transform *= multiplier;
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(
+        foundInCode("(*ANGLE_storageBuffer._udata)._utransform = "
+                    "(*ANGLE_storageBuffer._udata)._utransform *"))
+        << outputCode(SH_MSL_METAL_OUTPUT);
+    EXPECT_FALSE(foundInCode("(*ANGLE_storageBuffer._udata)._utransform *="));
+}
+
+TEST_F(MSLComputeOutputTest, ShaderStorageBufferMatrixElementAssignment)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+        layout(std430, binding = 0) buffer Data
+        {
+            mat4 data0;
+            mat4 data1;
+        } data;
+        uniform mat4 value;
+
+        void main()
+        {
+            data.data1[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+                value[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("reinterpret_cast<device float *>")) << outputCode(SH_MSL_METAL_OUTPUT);
+}
+
+TEST_F(MSLComputeOutputTest, ThreadLocalMatrixElementAssignment)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+        void main()
+        {
+            mat4 value = mat4(0.0);
+            value[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 1.0;
+        })";
+    compile(shaderString);
+    EXPECT_FALSE(foundInCode("reinterpret_cast<device float *>"))
+        << outputCode(SH_MSL_METAL_OUTPUT);
+}
+
+TEST_F(MSLComputeOutputTest, HelperFunctionComputeBuiltins)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+        uint getLocalX()
+        {
+            return gl_LocalInvocationID.x;
+        }
+        void main()
+        {
+            uint localX = getLocalX();
+            if (localX == 0u)
+            {
+                barrier();
+            }
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(
+        foundInCode("uint32_t _ugetLocalX(metal::uint3 ANGLE_globalInvocationID, "
+                    "metal::uint3 ANGLE_localInvocationID, uint32_t ANGLE_localInvocationIndex, "
+                    "metal::uint3 ANGLE_workGroupID, metal::uint3 ANGLE_numWorkGroups)"))
+        << outputCode(SH_MSL_METAL_OUTPUT);
+    EXPECT_TRUE(
+        foundInCode("_ugetLocalX(ANGLE_globalInvocationID, ANGLE_localInvocationID, "
+                    "ANGLE_localInvocationIndex, ANGLE_workGroupID, ANGLE_numWorkGroups)"))
+        << outputCode(SH_MSL_METAL_OUTPUT);
+}
+
+TEST_F(MSLComputeOutputTest, SharedVectorComponentAssignment)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+        shared vec4 values[4];
+        void writeValue()
+        {
+            values[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 1.0;
+        }
+        void main()
+        {
+            writeValue();
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("reinterpret_cast<threadgroup float *>"))
+        << outputCode(SH_MSL_METAL_OUTPUT);
+}
+
+TEST_F(MSLComputeOutputTest, ShaderImageArray)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(r32ui, binding = 0) writeonly uniform highp uimage2D images[2];
+        void main()
+        {
+            imageStore(images[0], ivec2(0), uvec4(11u));
+            imageStore(images[1], ivec2(0), uvec4(13u));
+        })";
+    compile(shaderString);
+    EXPECT_FALSE(foundInCode("metal::array<metal::texture2d"));
+    EXPECT_TRUE(foundInCode("metal::texture2d<uint, metal::access::write> _uimages_"));
+    EXPECT_TRUE(foundInCode("ANGLE_images._uimages_ANGLE_image_element_"));
+    EXPECT_TRUE(foundInCode("texture(0)]]"));
+    EXPECT_TRUE(foundInCode("texture(1)]]"));
+}
+
+TEST_F(MSLComputeOutputTest, TextureBufferSampler)
+{
+    getResources()->EXT_texture_buffer = 1;
+    const std::string &shaderString =
+        R"(#version 310 es
+        #extension GL_EXT_texture_buffer : require
+        layout(local_size_x = 1) in;
+        uniform highp usamplerBuffer source;
+        layout(std430, binding = 0) buffer Result
+        {
+            uvec4 value;
+        } result;
+        void main()
+        {
+            uint count = uint(textureSize(source));
+            if (count > 0u)
+            {
+                result.value = texelFetch(source, int(gl_GlobalInvocationID.x % count));
+            }
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::texture_buffer<uint32_t>"));
+    EXPECT_TRUE(foundInCode("ANGLE_texelFetch"));
+    EXPECT_TRUE(foundInCode("ANGLE_textureSize"));
+    EXPECT_TRUE(foundInCode("texture_buffer<T>"));
+}
+
+TEST_F(MSLComputeOutputTest, TextureBufferImageLoadStore)
+{
+    getResources()->EXT_texture_buffer = 1;
+    const std::string &shaderString =
+        R"(#version 310 es
+        #extension GL_EXT_texture_buffer : require
+        layout(local_size_x = 1) in;
+        layout(r32ui, binding = 0) uniform highp uimageBuffer image;
+        void main()
+        {
+            int count = imageSize(image);
+            if (count > 0)
+            {
+                uvec4 value = imageLoad(image, 0);
+                imageStore(image, int(gl_GlobalInvocationID.x), value);
+            }
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::texture_buffer<uint, metal::access::read_write>"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageSize"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageLoad"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageStore"));
+    EXPECT_TRUE(foundInCode("texture_buffer<T, Access>"));
+}
+
+TEST_F(MSLComputeOutputTest, TextureBufferImageAtomic)
+{
+    getResources()->EXT_texture_buffer      = 1;
+    getResources()->OES_shader_image_atomic = 1;
+    const std::string &shaderString =
+        R"(#version 310 es
+        #extension GL_EXT_texture_buffer : require
+        #extension GL_OES_shader_image_atomic : require
+        layout(local_size_x = 1) in;
+        layout(r32ui, binding = 0) uniform highp uimageBuffer image;
+        void main()
+        {
+            imageAtomicAdd(image, int(gl_GlobalInvocationID.x), 1u);
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("ANGLE_imageAtomicAdd"));
+    EXPECT_TRUE(foundInCode("atomic_fetch_add"));
+    EXPECT_TRUE(foundInCode("texture_buffer<T, Access>"));
+}
+
+TEST_F(MSLComputeOutputTest, TextureBufferR32fImageAtomicExchange)
+{
+    getResources()->EXT_texture_buffer      = 1;
+    getResources()->OES_shader_image_atomic = 1;
+    ShCompileOptions options                = defaultOptions();
+    options.emulateR32fImageAtomicExchange  = true;
+    setDefaultCompileOptions(options);
+    const std::string &shaderString =
+        R"(#version 310 es
+        #extension GL_EXT_texture_buffer : require
+        #extension GL_OES_shader_image_atomic : require
+        layout(local_size_x = 1) in;
+        layout(r32f, binding = 0) uniform highp imageBuffer image;
+        void main()
+        {
+            float previous = imageAtomicExchange(image, 0, 2.5);
+            imageStore(image, 0, vec4(previous));
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::texture_buffer<uint, metal::access::read_write>"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageAtomicExchange"));
+    EXPECT_TRUE(foundInCode("atomic_exchange"));
+}
+
+TEST_F(MSLComputeOutputTest, LayeredImage2DArray)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(r32ui, binding = 0) uniform highp uimage2DArray image;
+        void main()
+        {
+            ivec3 coord = ivec3(0, 0, 1);
+            uvec4 value = imageLoad(image, coord);
+            imageStore(image, coord, value + uvec4(uint(imageSize(image).z)));
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::texture2d_array<uint, metal::access::read_write>"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageSize"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageLoad"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageStore"));
+}
+
+TEST_F(MSLComputeOutputTest, LayeredImage3D)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(r32ui, binding = 0) uniform highp uimage3D image;
+        void main()
+        {
+            ivec3 coord = ivec3(0, 0, 1);
+            uvec4 value = imageLoad(image, coord);
+            imageStore(image, coord, value + uvec4(uint(imageSize(image).z)));
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::texture3d<uint, metal::access::read_write>"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageSize"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageLoad"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageStore"));
+}
+
+TEST_F(MSLComputeOutputTest, LayeredImageCube)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        layout(local_size_x = 1) in;
+        layout(r32ui, binding = 0) uniform highp uimageCube image;
+        void main()
+        {
+            ivec3 coord = ivec3(0, 0, 1);
+            uvec4 value = imageLoad(image, coord);
+            imageStore(image, coord, value + uvec4(uint(imageSize(image).x)));
+        })";
+    compile(shaderString);
+    EXPECT_TRUE(foundInCode("metal::texturecube<uint, metal::access::read_write>"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageSize"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageLoad"));
+    EXPECT_TRUE(foundInCode("ANGLE_imageStore"));
+}
+
 // Test that having dynamic indexing of a vector inside the right hand side of logical or doesn't
 // trigger asserts in MSL output.
 TEST_F(MSLOutputTest, DynamicIndexingOfVectorOnRightSideOfLogicalOr)
@@ -455,6 +864,26 @@ TEST_F(MSLVertexOutputTest, Vertex)
             gl_Position = vec4(1.0,1.0,1.0,1.0);
         })";
     compile(shaderString);
+}
+
+TEST_F(MSLVertexOutputTest, TransformFeedbackReplayHooks)
+{
+    const std::string &shaderString =
+        R"(#version 310 es
+        precision highp float;
+        out highp vec4 v_color;
+        void main()
+        {
+            gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+            v_color = vec4(1.0);
+        })";
+    compile(shaderString);
+
+    const std::string code = outputCode(SH_MSL_METAL_OUTPUT);
+    EXPECT_NE(code.find("ANGLE_@@XFB-REPLAY@@"), std::string::npos);
+    EXPECT_NE(code.find("ANGLE_@@XFB-REPLAY-OUT@@"), std::string::npos);
+    EXPECT_NE(code.find("ANGLE_xfbReplayBuffer [[buffer("), std::string::npos);
+    EXPECT_NE(code.find("#elif TRANSFORM_FEEDBACK_REPLAY"), std::string::npos);
 }
 
 TEST_F(MSLVertexOutputTest, LastReturn)
@@ -954,6 +1383,33 @@ void main(){
     compile(kShader);
 }
 
+TEST_F(MSLVertexOutputTest, ExplicitVaryingLocation)
+{
+    const char kShader[] = R"(#version 310 es
+precision highp float;
+layout(location = 3) out vec4 o_val5;
+void main(){
+    gl_Position = vec4(1.0);
+    o_val5 = vec4(1.0);
+})";
+    compile(kShader);
+    EXPECT_TRUE(foundInCode("_uo_val5 [[user(locn3)]]"));
+}
+
+TEST_F(MSLOutputTest, ExplicitFlatVaryingLocation)
+{
+    const char kShader[] = R"(#version 310 es
+precision highp float;
+precision highp int;
+layout(location = 3) flat in uvec4 i_val5;
+layout(location = 0) out vec4 o_color;
+void main(){
+    o_color = vec4(i_val5);
+})";
+    compile(kShader);
+    EXPECT_TRUE(foundInCode("_ui_val5 [[flat, user(locn3)]]"));
+}
+
 // Tests that rewriting attributes for per-element element access does not cause crash.
 // At the time of writing a_ would be confused with a due to matrixes being flattened
 // for fragment inputs, and the new variables would be given semantic names separated
@@ -1048,8 +1504,8 @@ TEST_F(MSLOutputTest, UnnamedOutParameterNoCrash)
 
 TEST_F(MSLOutputTest, ExplicitBoolCastsNoCrash)
 {
-    ShCompileOptions options     = defaultOptions();
-    const char kShader[]         = R"(
+    ShCompileOptions options = defaultOptions();
+    const char kShader[]     = R"(
 precision mediump float;
 void main(){vec2 c;bvec2 U=bvec2(c.xx);if (U.x) gl_FragColor = vec4(1);})";
     compile(kShader, options);

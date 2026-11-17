@@ -63,6 +63,7 @@ class Pipeline
         Texture,
         Image,
         InstanceId,
+        StorageBuffer,
     };
 
     enum class Variant
@@ -119,6 +120,7 @@ struct PipelineStructs : angle::NonCopyable
     PipelineScoped<TStructure> invocationVertexGlobals;
     PipelineScoped<TStructure> invocationFragmentGlobals;
     PipelineScoped<TStructure> uniformBuffers;
+    PipelineScoped<TStructure> storageBuffers;
     PipelineScoped<TStructure> texture;
     PipelineScoped<TStructure> image;
     PipelineScoped<TStructure> instanceId;

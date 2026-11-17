@@ -404,7 +404,7 @@ ConversionBufferMtl *BufferMtl::getVertexConversionBuffer(ContextMtl *context,
     for (VertexConversionBufferMtl &buffer : mVertexConversionBuffers)
     {
         if (buffer.formatID == formatID && buffer.stride == stride && buffer.offset <= offset &&
-            buffer.offset % buffer.stride == offset % stride)
+            (stride == 0 ? buffer.offset == offset : buffer.offset % stride == offset % stride))
         {
             return &buffer;
         }

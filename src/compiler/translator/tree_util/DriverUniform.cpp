@@ -28,6 +28,7 @@ constexpr const char kFlipXY[]           = "flipXY";
 constexpr const char kMisc[]             = "misc";
 constexpr const char kBaseInstance[]     = "baseInstance";
 constexpr const char kAcbBufferOffsets[] = "acbBufferOffsets";
+constexpr const char kImageLayers[]      = "imageLayers";
 constexpr const char kTransformXY[]      = "transformXY";
 
 // Extended uniforms
@@ -66,16 +67,36 @@ void DriverUniform::addComputeDriverUniformsToShader(TIntermBlock *root, TSymbol
         driverFieldList->push_back(driverUniformField);
     }
 
-    // Define a driver uniform block "ANGLEUniformBlock" with instance name "ANGLEUniforms".
-    TLayoutQualifier layoutQualifier = TLayoutQualifier::Create();
-    layoutQualifier.blockStorage     = EbsStd140;
-    layoutQualifier.pushConstant     = true;
+    if (mOutputType == SH_MSL_METAL_OUTPUT)
+    {
+        TType *imageLayersType = new TType(EbtUInt, EbpHigh, EvqGlobal);
+        imageLayersType->makeArray(8);
+        driverFieldList->push_back(new TField(imageLayersType, ImmutableString(kImageLayers),
+                                              TSourceLoc(), SymbolType::AngleInternal));
+    }
 
-    const TInterfaceBlock *interfaceBlock = DeclareInterfaceBlock(
-        symbolTable, driverFieldList, layoutQualifier, kDriverUniformsBlockName);
-    mDriverUniforms = DeclareInterfaceBlockVariable(root, symbolTable, EvqUniform, interfaceBlock,
-                                                    layoutQualifier, TMemoryQualifier::Create(), 0,
-                                                    kDriverUniformsVarName);
+    if (mMode == DriverUniformMode::InterfaceBlock)
+    {
+        // Define a driver uniform block "ANGLEUniformBlock" with instance name "ANGLEUniforms".
+        TLayoutQualifier layoutQualifier = TLayoutQualifier::Create();
+        layoutQualifier.blockStorage     = EbsStd140;
+        layoutQualifier.pushConstant     = true;
+
+        const TInterfaceBlock *interfaceBlock = DeclareInterfaceBlock(
+            symbolTable, driverFieldList, layoutQualifier, kDriverUniformsBlockName);
+        mDriverUniforms = DeclareInterfaceBlockVariable(
+            root, symbolTable, EvqUniform, interfaceBlock, layoutQualifier,
+            TMemoryQualifier::Create(), 0, kDriverUniformsVarName);
+    }
+    else
+    {
+        // Direct MSL represents driver uniforms as a structure, like graphics shaders do.
+        const ImmutableString varName = ImmutableString(kDriverUniformsVarNameMSL);
+        auto result =
+            DeclareStructure(root, symbolTable, driverFieldList, EvqUniform,
+                             TMemoryQualifier::Create(), 0, kDriverUniformsBlockName, &varName);
+        mDriverUniforms = result.second;
+    }
 }
 
 TFieldList *DriverUniform::createUniformFields(TSymbolTable *symbolTable)

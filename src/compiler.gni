@@ -183,6 +183,8 @@ angle_translator_sources = [
   "src/compiler/translator/tree_ops/RewriteAtomicCounters.h",
   "src/compiler/translator/tree_ops/RewriteDfdy.cpp",
   "src/compiler/translator/tree_ops/RewriteDfdy.h",
+  "src/compiler/translator/tree_ops/spirv/RewriteR32fImages.cpp",
+  "src/compiler/translator/tree_ops/spirv/RewriteR32fImages.h",
   "src/compiler/translator/tree_ops/RewritePixelLocalStorage.cpp",
   "src/compiler/translator/tree_ops/RewritePixelLocalStorage.h",
   "src/compiler/translator/tree_ops/RewriteStructSamplers.cpp",
@@ -339,8 +341,6 @@ angle_translator_lib_spirv_sources = [
   "src/compiler/translator/tree_ops/spirv/ReswizzleYUVOps.h",
   "src/compiler/translator/tree_ops/spirv/RewriteInterpolateAtOffset.cpp",
   "src/compiler/translator/tree_ops/spirv/RewriteInterpolateAtOffset.h",
-  "src/compiler/translator/tree_ops/spirv/RewriteR32fImages.cpp",
-  "src/compiler/translator/tree_ops/spirv/RewriteR32fImages.h",
   "src/compiler/translator/tree_ops/spirv/RewriteSamplerExternalTexelFetch.cpp",
   "src/compiler/translator/tree_ops/spirv/RewriteSamplerExternalTexelFetch.h",
 ]

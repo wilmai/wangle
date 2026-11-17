@@ -25,6 +25,7 @@ class DriverUniformMetal : public DriverUniformExtended
     ~DriverUniformMetal() override {}
 
     TIntermTyped *getCoverageMaskField() const;
+    TIntermTyped *getImageLayersField() const;
 
   protected:
     TFieldList *createUniformFields(TSymbolTable *symbolTable) override;

@@ -41,7 +41,7 @@ class Rewriter : public TIntermRebuild
                     }
                 }
             }
-            else if (retType.isVector())
+            else if (retType.isVector() && !retType.isArray())
             {
                 // 1 element arrays need to be accounted for.
                 if (argCount == 1 && !retType.isArray())
@@ -59,7 +59,7 @@ class Rewriter : public TIntermRebuild
                     SetArg(callNode, i, CoerceSimple(retType.getBasicType(), arg));
                 }
             }
-            else if (retType.isMatrix())
+            else if (retType.isMatrix() && !retType.isArray())
             {
                 if (argCount == 1)
                 {

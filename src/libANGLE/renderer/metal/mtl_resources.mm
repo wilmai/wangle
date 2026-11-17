@@ -293,6 +293,37 @@ angle::Result Texture::Make3DTexture(ContextMtl *context,
     }  // ANGLE_MTL_OBJC_SCOPE
 }
 
+angle::Result Texture::MakeBufferTexture(ContextMtl *context,
+                                         MTLPixelFormat pixelFormat,
+                                         const BufferRef &buffer,
+                                         size_t offset,
+                                         uint32_t width,
+                                         size_t bytesPerRow,
+                                         MTLTextureUsage usage,
+                                         TextureRef *refOut)
+{
+    ANGLE_MTL_OBJC_SCOPE
+    {
+        ANGLE_CHECK(context, buffer && pixelFormat != MTLPixelFormatInvalid,
+                    "Invalid buffer texture backing", GL_INVALID_OPERATION);
+
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor
+            textureBufferDescriptorWithPixelFormat:pixelFormat
+                                              width:width
+                                    resourceOptions:buffer->get().resourceOptions
+                                              usage:usage];
+        id<MTLTexture> metalTexture = [buffer->get() newTextureWithDescriptor:desc
+                                                                       offset:offset
+                                                                  bytesPerRow:bytesPerRow];
+        ANGLE_CHECK_GL_ALLOC(context, metalTexture);
+
+        Texture *newTexture = new Texture(buffer.get(), metalTexture);
+        ANGLE_CHECK_GL_ALLOC(context, newTexture);
+        refOut->reset(newTexture);
+    }
+    return angle::Result::Continue;
+}
+
 /** static */
 angle::Result Texture::MakeTexture(ContextMtl *context,
                                    const Format &mtlFormat,
@@ -390,6 +421,12 @@ Texture::Texture(id<MTLTexture> metalTexture)
     set(metalTexture);
 }
 
+Texture::Texture(Resource *original, id<MTLTexture> metalTexture)
+    : Resource(original), mColorWritableMask(std::make_shared<MTLColorWriteMask>(MTLColorWriteMaskAll))
+{
+    set(metalTexture);
+}
+
 Texture::Texture(std::shared_ptr<UsageRef> usageRef,
                  id<MTLTexture> metalTexture,
                  std::shared_ptr<MTLColorWriteMask> colorWriteMask)
@@ -475,6 +512,17 @@ Texture::Texture(ContextMtl *context,
         if (allowFormatView)
         {
             desc.usage = desc.usage | MTLTextureUsagePixelFormatView;
+        }
+
+        if (!memoryLess && desc.textureType != MTLTextureType2DMultisample &&
+            (desc.pixelFormat == MTLPixelFormatR32Sint ||
+             desc.pixelFormat == MTLPixelFormatR32Uint) &&
+            context->getDisplay()->getNativeExtensions().shaderImageAtomicOES)
+        {
+            if (@available(macOS 14.0, iOS 17.0, *))
+            {
+                desc.usage |= MTLTextureUsageShaderAtomic;
+            }
         }
 
         set(metalDevice.newTextureWithDescriptor(desc));
@@ -716,6 +764,13 @@ TextureRef Texture::createCubeFaceView(uint32_t face)
 
 TextureRef Texture::createSliceMipView(uint32_t slice, const MipmapNativeLevel &level)
 {
+    return createSliceMipView(slice, level, pixelFormat());
+}
+
+TextureRef Texture::createSliceMipView(uint32_t slice,
+                                       const MipmapNativeLevel &level,
+                                       MTLPixelFormat format)
+{
     ANGLE_MTL_OBJC_SCOPE
     {
         switch (textureType())
@@ -723,7 +778,7 @@ TextureRef Texture::createSliceMipView(uint32_t slice, const MipmapNativeLevel &
             case MTLTextureTypeCube:
             case MTLTextureType2D:
             case MTLTextureType2DArray:
-                return TextureRef(new Texture(this, pixelFormat(), MTLTextureType2D,
+                return TextureRef(new Texture(this, format, MTLTextureType2D,
                                               NSMakeRange(level.get(), 1), NSMakeRange(slice, 1)));
             default:
                 UNREACHABLE();
@@ -734,20 +789,32 @@ TextureRef Texture::createSliceMipView(uint32_t slice, const MipmapNativeLevel &
 
 TextureRef Texture::createMipView(const MipmapNativeLevel &level)
 {
+    return createMipView(level, pixelFormat());
+}
+
+TextureRef Texture::createMipView(const MipmapNativeLevel &level, MTLPixelFormat format)
+{
     ANGLE_MTL_OBJC_SCOPE
     {
         NSUInteger slices = cubeFacesOrArrayLength();
-        return TextureRef(new Texture(this, pixelFormat(), textureType(),
+        return TextureRef(new Texture(this, format, textureType(),
                                       NSMakeRange(level.get(), 1), NSMakeRange(0, slices)));
     }
 }
 
 TextureRef Texture::createMipsView(const MipmapNativeLevel &baseLevel, uint32_t levels)
 {
+    return createMipsView(baseLevel, levels, pixelFormat());
+}
+
+TextureRef Texture::createMipsView(const MipmapNativeLevel &baseLevel,
+                                   uint32_t levels,
+                                   MTLPixelFormat format)
+{
     ANGLE_MTL_OBJC_SCOPE
     {
         NSUInteger slices = cubeFacesOrArrayLength();
-        return TextureRef(new Texture(this, pixelFormat(), textureType(),
+        return TextureRef(new Texture(this, format, textureType(),
                                       NSMakeRange(baseLevel.get(), levels),
                                       NSMakeRange(0, slices)));
     }
@@ -769,6 +836,22 @@ TextureRef Texture::createShaderImageView2D(const MipmapNativeLevel &level,
     ASSERT(textureType() != MTLTextureType3D);
     return TextureRef(new Texture(this, format, MTLTextureType2D, NSMakeRange(level.get(), 1),
                                   NSMakeRange(layer, 1)));
+}
+
+TextureRef Texture::createShaderImageViewLayered(const MipmapNativeLevel &level,
+                                                 MTLPixelFormat format,
+                                                 bool cubeAs2DArray)
+{
+    ASSERT(isShaderReadable());
+    ASSERT(isShaderWritable());
+    ASSERT(format == pixelFormat() || supportFormatView());
+    ASSERT(textureType() == MTLTextureType2DArray || textureType() == MTLTextureType3D ||
+           textureType() == MTLTextureTypeCube);
+    const MTLTextureType viewType = cubeAs2DArray && textureType() == MTLTextureTypeCube
+                                       ? MTLTextureType2DArray
+                                       : textureType();
+    return TextureRef(new Texture(this, format, viewType, NSMakeRange(level.get(), 1),
+                                  NSMakeRange(0, cubeFacesOrArrayLength())));
 }
 
 TextureRef Texture::createViewWithCompatibleFormat(MTLPixelFormat format)

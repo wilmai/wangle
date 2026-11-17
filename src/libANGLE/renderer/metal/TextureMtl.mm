@@ -40,6 +40,49 @@ namespace rx
 namespace
 {
 
+mtl::Format GetShaderImageAccessFormat(ContextMtl *contextMtl, GLenum format)
+{
+    if (format == GL_R32F && contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES)
+    {
+        format = GL_R32UI;
+    }
+    return contextMtl->getPixelFormat(angle::Format::InternalFormatToID(format));
+}
+
+bool UsesR32FloatAtomicBacking(ContextMtl *contextMtl, const mtl::Format &format)
+{
+    return format.metalFormat == MTLPixelFormatR32Float &&
+           contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES;
+}
+
+MTLPixelFormat GetBufferTexturePixelFormat(ContextMtl *contextMtl, GLenum internalFormat)
+{
+    switch (internalFormat)
+    {
+        case GL_RGB32F:
+            if (@available(macOS 27.0, macCatalyst 27.0, iOS 27.0, *))
+            {
+                return MTLPixelFormatRGB32Float;
+            }
+            return MTLPixelFormatInvalid;
+        case GL_RGB32I:
+            if (@available(macOS 27.0, macCatalyst 27.0, iOS 27.0, *))
+            {
+                return MTLPixelFormatRGB32Sint;
+            }
+            return MTLPixelFormatInvalid;
+        case GL_RGB32UI:
+            if (@available(macOS 27.0, macCatalyst 27.0, iOS 27.0, *))
+            {
+                return MTLPixelFormatRGB32Uint;
+            }
+            return MTLPixelFormatInvalid;
+        default:
+            return contextMtl->getPixelFormat(angle::Format::InternalFormatToID(internalFormat))
+                .metalFormat;
+    }
+}
+
 gl::ImageIndex GetZeroLevelIndex(const mtl::TextureRef &image)
 {
     switch (image->textureType())
@@ -842,22 +885,31 @@ class TextureMtl::NativeTextureWrapperWithViewSupport : public NativeTextureWrap
     // Create a view of one slice at a level.
     mtl::TextureRef createSliceMipView(uint32_t slice, GLuint glLevel)
     {
-        return mNativeTexture->createSliceMipView(slice, getNativeLevel(glLevel));
+        return mNativeTexture->createSliceMipView(slice, getNativeLevel(glLevel),
+                                                  mFormat.metalFormat);
     }
     // Create a levels range view
     mtl::TextureRef createMipsView(GLuint glLevel, uint32_t levels)
     {
-        return mNativeTexture->createMipsView(getNativeLevel(glLevel), levels);
+        return mNativeTexture->createMipsView(getNativeLevel(glLevel), levels,
+                                              mFormat.metalFormat);
     }
     // Create a view of a level.
     mtl::TextureRef createMipView(GLuint glLevel)
     {
-        return mNativeTexture->createMipView(getNativeLevel(glLevel));
+        return mNativeTexture->createMipView(getNativeLevel(glLevel), mFormat.metalFormat);
     }
     // Create a view for a shader image binding.
     mtl::TextureRef createShaderImageView2D(GLuint glLevel, int layer, MTLPixelFormat format)
     {
         return mNativeTexture->createShaderImageView2D(getNativeLevel(glLevel), layer, format);
+    }
+    mtl::TextureRef createShaderImageViewLayered(GLuint glLevel,
+                                                MTLPixelFormat format,
+                                                bool cubeAs2DArray = false)
+    {
+        return mNativeTexture->createShaderImageViewLayered(getNativeLevel(glLevel), format,
+                                                            cubeAs2DArray);
     }
 
     // Create a swizzled view
@@ -889,6 +941,7 @@ void TextureMtl::deallocateNativeStorage(bool keepImages, bool keepSamplerStateA
     {
         mTexImageDefs.clear();
         mShaderImageViews.clear();
+        mShaderLayeredImageViews.clear();
     }
     else if (mNativeTextureStorage)
     {
@@ -899,6 +952,11 @@ void TextureMtl::deallocateNativeStorage(bool keepImages, bool keepSamplerStateA
     mNativeTextureStorage       = nullptr;
     mViewFromBaseToMaxLevel     = nullptr;
     mSwizzleStencilSamplingView = nullptr;
+    mBufferTextureViews.clear();
+    mBufferTextureSourceBuffer.reset();
+    mBufferTextureOffset = 0;
+    mBufferTextureSize = 0;
+    mBufferTextureInternalFormat = GL_NONE;
 
     // Clear render target cache for each texture's image. We don't erase them because they
     // might still be referenced by a framebuffer.
@@ -1023,20 +1081,23 @@ angle::Result TextureMtl::ensureNativeStorageCreated(const gl::Context *context,
             // format.
             gl::Extents actualMipSize = mNativeTextureStorage->size(imageMipLevel);
             if (imageToTransfer && imageToTransfer->sizeAt0() == actualMipSize &&
-                imageToTransfer->arrayLength() == mNativeTextureStorage->arrayLength() &&
-                imageToTransfer->pixelFormat() == mNativeTextureStorage->pixelFormat())
+                imageToTransfer->arrayLength() == mNativeTextureStorage->arrayLength())
             {
-                mtl::BlitCommandEncoder *encoder = GetBlitCommandEncoderForResources(
-                    contextMtl,
-                    {imageToTransfer.get(), mNativeTextureStorage->getNativeTexture().get()});
+                mtl::TextureRef destinationMipView =
+                    mNativeTextureStorage->createMipView(imageMipLevel);
+                if (imageToTransfer->pixelFormat() == destinationMipView->pixelFormat())
+                {
+                    mtl::BlitCommandEncoder *encoder = GetBlitCommandEncoderForResources(
+                        contextMtl, {imageToTransfer.get(), destinationMipView.get()});
 
-                encoder->copyTexture(imageToTransfer, 0, mtl::kZeroNativeMipLevel,
-                                     *mNativeTextureStorage, face, actualMip,
-                                     imageToTransfer->arrayLength(), 1);
+                    encoder->copyTexture(imageToTransfer, 0, mtl::kZeroNativeMipLevel,
+                                         destinationMipView, face, mtl::kZeroNativeMipLevel,
+                                         imageToTransfer->arrayLength(), 1);
 
-                // Invalidate texture image definition at this index so that we can make it a
-                // view of the native texture at this index later.
-                imageToTransfer = nullptr;
+                    // Invalidate texture image definition at this index so we can make it a view
+                    // of native storage later.
+                    imageToTransfer = nullptr;
+                }
             }
         }
     }
@@ -1061,38 +1122,50 @@ angle::Result TextureMtl::createNativeStorage(const gl::Context *context,
 
     // Create actual texture object:
     mSlices              = 1;
+    // GL image binding permits equal-size format reinterpretation.  Metal requires textures to
+    // opt into pixel-format views when creating the corresponding image view, so enable them for
+    // formats that can be shader-written as well as depth/stencil and PLS formats.
     bool allowFormatView =
-        format.hasDepthAndStencilBits() ||
+        format.caps.writable || format.hasDepthAndStencilBits() ||
         needsFormatViewForPixelLocalStorage(
             contextMtl->getDisplay()->getNativePixelLocalStorageOptions(), format);
+    mtl::Format nativeStorageFormat = format;
+    if (samples == 0 && type != gl::TextureType::_2DMultisample &&
+        UsesR32FloatAtomicBacking(contextMtl, format))
+    {
+        // Metal doesn't allow ShaderAtomic usage on R32Float.  Store the same 32-bit texel bits in
+        // an atomic-capable R32Uint texture and expose the normal GL float behavior through views.
+        nativeStorageFormat.metalFormat = MTLPixelFormatR32Uint;
+        allowFormatView                  = true;
+    }
     mtl::TextureRef nativeTextureStorage;
     switch (type)
     {
         case gl::TextureType::_2D:
-            ANGLE_TRY(mtl::Texture::Make2DTexture(contextMtl, format, size.width, size.height, mips,
-                                                  /** renderTargetOnly */ false, allowFormatView,
-                                                  &nativeTextureStorage));
+            ANGLE_TRY(mtl::Texture::Make2DTexture(
+                contextMtl, nativeStorageFormat, size.width, size.height, mips,
+                /** renderTargetOnly */ false, allowFormatView, &nativeTextureStorage));
             break;
         case gl::TextureType::CubeMap:
             mSlices = 6;
-            ANGLE_TRY(mtl::Texture::MakeCubeTexture(contextMtl, format, size.width, mips,
+            ANGLE_TRY(mtl::Texture::MakeCubeTexture(contextMtl, nativeStorageFormat, size.width, mips,
                                                     /** renderTargetOnly */ false, allowFormatView,
                                                     &nativeTextureStorage));
             break;
         case gl::TextureType::_3D:
             ANGLE_TRY(mtl::Texture::Make3DTexture(
-                contextMtl, format, size.width, size.height, size.depth, mips,
+                contextMtl, nativeStorageFormat, size.width, size.height, size.depth, mips,
                 /** renderTargetOnly */ false, allowFormatView, &nativeTextureStorage));
             break;
         case gl::TextureType::_2DArray:
             mSlices = size.depth;
             ANGLE_TRY(mtl::Texture::Make2DArrayTexture(
-                contextMtl, format, size.width, size.height, mips, mSlices,
+                contextMtl, nativeStorageFormat, size.width, size.height, mips, mSlices,
                 /** renderTargetOnly */ false, allowFormatView, &nativeTextureStorage));
             break;
         case gl::TextureType::_2DMultisample:
             ANGLE_TRY(mtl::Texture::Make2DMSTexture(
-                contextMtl, format, size.width, size.height, samples,
+                contextMtl, nativeStorageFormat, size.width, size.height, samples,
                 /** renderTargetOnly */ false, allowFormatView, &nativeTextureStorage));
             break;
         default:
@@ -1176,8 +1249,10 @@ angle::Result TextureMtl::createViewFromBaseToMaxLevel()
     maxLevel = std::max(maxLevel, baseLevel);
 
     mtl::TextureRef nativeViewFromBaseToMaxLevelRef;
+    const bool needsLogicalFormatView =
+        mNativeTextureStorage->pixelFormat() != mNativeTextureStorage->getFormat().metalFormat;
     if (maxLevel == mNativeTextureStorage->getMaxSupportedGLLevel() &&
-        baseLevel == mNativeTextureStorage->getBaseGLLevel())
+        baseLevel == mNativeTextureStorage->getBaseGLLevel() && !needsLogicalFormatView)
     {
         // If base & max level are the same in mNativeTextureStorage, we don't need
         // a dedicated view. Furthermore, Intel driver has some bugs when sampling a view
@@ -1726,6 +1801,78 @@ angle::Result TextureMtl::setImageExternal(const gl::Context *context,
     return angle::Result::Stop;
 }
 
+angle::Result TextureMtl::setBuffer(const gl::Context *context, GLenum internalFormat)
+{
+    deallocateNativeStorage(/*keepImages=*/false);
+    mBoundSurface = nullptr;
+    mtl::GetImpl(context)->invalidateCurrentTextures();
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::ensureBufferTextureCreated(const gl::Context *context,
+                                                     MTLTextureUsage usage,
+                                                     GLenum viewFormat,
+                                                     mtl::TextureRef *textureOut)
+{
+    ASSERT(mState.getType() == gl::TextureType::Buffer);
+    const gl::OffsetBindingPointer<gl::Buffer> &bufferBinding = mState.getBuffer();
+    gl::Buffer *buffer = bufferBinding.get();
+    if (!buffer)
+    {
+        textureOut->reset();
+        return angle::Result::Continue;
+    }
+
+    const gl::ImageDesc &imageDesc = mState.getBaseLevelDesc();
+    if (imageDesc.size.width == 0)
+    {
+        textureOut->reset();
+        return angle::Result::Continue;
+    }
+
+    ContextMtl *contextMtl = mtl::GetImpl(context);
+    BufferMtl *bufferMtl = mtl::GetImpl(buffer);
+    mtl::BufferRef metalBuffer = bufferMtl->getCurrentBuffer();
+    ANGLE_CHECK(contextMtl, metalBuffer, gl::err::kInternalError, GL_INVALID_OPERATION);
+
+    const GLenum internalFormat = imageDesc.format.info->sizedInternalFormat;
+    const GLenum effectiveViewFormat = viewFormat == GL_NONE ? internalFormat : viewFormat;
+    const MTLPixelFormat pixelFormat = GetBufferTexturePixelFormat(contextMtl, effectiveViewFormat);
+    ANGLE_CHECK(contextMtl, pixelFormat != MTLPixelFormatInvalid, gl::err::kInternalError,
+                GL_INVALID_OPERATION);
+
+    const size_t offset = static_cast<size_t>(bufferBinding.getOffset());
+    const size_t availableSize = bufferBinding.getSize() == 0
+                                     ? static_cast<size_t>(buffer->getSize()) - offset
+                                     : static_cast<size_t>(bufferBinding.getSize());
+    if (mBufferTextureSourceBuffer != metalBuffer || mBufferTextureOffset != offset ||
+        mBufferTextureSize != availableSize || mBufferTextureInternalFormat != internalFormat)
+    {
+        mBufferTextureViews.clear();
+        mBufferTextureSourceBuffer = metalBuffer;
+        mBufferTextureOffset = offset;
+        mBufferTextureSize = availableSize;
+        mBufferTextureInternalFormat = internalFormat;
+    }
+
+    const uint32_t width = static_cast<uint32_t>(std::min<GLuint>(
+        static_cast<GLuint>(imageDesc.size.width), context->getCaps().maxTextureBufferSize));
+    const angle::Format &viewAngleFormat =
+        angle::Format::Get(angle::Format::InternalFormatToID(effectiveViewFormat));
+    const size_t bytesPerRow = static_cast<size_t>(width) * viewAngleFormat.pixelBytes;
+    const auto viewKey = std::make_pair(static_cast<uint32_t>(usage), effectiveViewFormat);
+    auto iter = mBufferTextureViews.find(viewKey);
+    if (iter == mBufferTextureViews.end())
+    {
+        mtl::TextureRef texture;
+        ANGLE_TRY(mtl::Texture::MakeBufferTexture(contextMtl, pixelFormat, metalBuffer, offset,
+                                                  width, bytesPerRow, usage, &texture));
+        iter = mBufferTextureViews.emplace(viewKey, std::move(texture)).first;
+    }
+    *textureOut = iter->second;
+    return angle::Result::Continue;
+}
+
 angle::Result TextureMtl::generateMipmap(const gl::Context *context)
 {
     // glGenerateMipmap needs the full mip chain allocated, expanding the storage if it was
@@ -1923,6 +2070,17 @@ angle::Result TextureMtl::syncState(const gl::Context *context,
                                     gl::Command source)
 {
     ContextMtl *contextMtl = mtl::GetImpl(context);
+    if (mState.getType() == gl::TextureType::Buffer)
+    {
+        // Buffer contents are shared with the MTLBuffer. Recreate the texture view only when
+        // the underlying Metal buffer allocation or buffer-texture state changes.
+        if (dirtyBits.test(gl::Texture::DIRTY_BIT_IMPLEMENTATION))
+        {
+            mBufferTextureViews.clear();
+        }
+        return angle::Result::Continue;
+    }
+
     for (size_t dirtyBit : dirtyBits)
     {
         switch (dirtyBit)
@@ -1973,19 +2131,10 @@ angle::Result TextureMtl::syncState(const gl::Context *context,
     return angle::Result::Continue;
 }
 
-angle::Result TextureMtl::bindToShader(const gl::Context *context,
-                                       mtl::RenderCommandEncoder *cmdEncoder,
-                                       gl::ShaderType shaderType,
-                                       gl::Sampler *sampler,
-                                       int textureSlotIndex,
-                                       int samplerSlotIndex)
+mtl::TextureRef TextureMtl::getTextureForSampling(const gl::Context *context)
 {
     ASSERT(mNativeTextureStorage);
     ASSERT(mViewFromBaseToMaxLevel);
-
-    float minLodClamp;
-    float maxLodClamp;
-    id<MTLSamplerState> samplerState;
 
     if (!mSwizzleStencilSamplingView)
     {
@@ -2042,6 +2191,20 @@ angle::Result TextureMtl::bindToShader(const gl::Context *context,
         }
     }
 
+    return mSwizzleStencilSamplingView;
+}
+
+angle::Result TextureMtl::bindToShader(const gl::Context *context,
+                                       mtl::RenderCommandEncoder *cmdEncoder,
+                                       gl::ShaderType shaderType,
+                                       gl::Sampler *sampler,
+                                       int textureSlotIndex,
+                                       int samplerSlotIndex)
+{
+    float minLodClamp;
+    float maxLodClamp;
+    id<MTLSamplerState> samplerState;
+
     if (!sampler)
     {
         samplerState = mMetalSamplerState;
@@ -2058,9 +2221,59 @@ angle::Result TextureMtl::bindToShader(const gl::Context *context,
 
     minLodClamp = std::max(minLodClamp, 0.f);
 
-    cmdEncoder->setTexture(shaderType, mSwizzleStencilSamplingView, textureSlotIndex);
+    if (mState.getType() == gl::TextureType::Buffer)
+    {
+        mtl::TextureRef texture;
+        ANGLE_TRY(ensureBufferTextureCreated(context, MTLTextureUsageShaderRead, GL_NONE,
+                                             &texture));
+        cmdEncoder->setTexture(shaderType, texture, textureSlotIndex);
+        return angle::Result::Continue;
+    }
+
+    cmdEncoder->setTexture(shaderType, getTextureForSampling(context), textureSlotIndex);
     cmdEncoder->setSamplerState(shaderType, samplerState, minLodClamp, maxLodClamp,
                                 samplerSlotIndex);
+
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::bindToShader(const gl::Context *context,
+                                       mtl::ComputeCommandEncoder *cmdEncoder,
+                                       gl::Sampler *sampler,
+                                       int textureSlotIndex,
+                                       int samplerSlotIndex)
+{
+    float minLodClamp;
+    float maxLodClamp;
+    id<MTLSamplerState> samplerState;
+
+    if (!sampler)
+    {
+        samplerState = mMetalSamplerState;
+        minLodClamp  = mState.getSamplerState().getMinLod();
+        maxLodClamp  = mState.getSamplerState().getMaxLod();
+    }
+    else
+    {
+        SamplerMtl *samplerMtl = mtl::GetImpl(sampler);
+        samplerState           = samplerMtl->getSampler(mtl::GetImpl(context));
+        minLodClamp            = sampler->getSamplerState().getMinLod();
+        maxLodClamp            = sampler->getSamplerState().getMaxLod();
+    }
+
+    minLodClamp = std::max(minLodClamp, 0.f);
+
+    if (mState.getType() == gl::TextureType::Buffer)
+    {
+        mtl::TextureRef texture;
+        ANGLE_TRY(ensureBufferTextureCreated(context, MTLTextureUsageShaderRead, GL_NONE,
+                                             &texture));
+        cmdEncoder->setTexture(texture, textureSlotIndex);
+        return angle::Result::Continue;
+    }
+
+    cmdEncoder->setTexture(getTextureForSampling(context), textureSlotIndex);
+    cmdEncoder->setSamplerState(samplerState, minLodClamp, maxLodClamp, samplerSlotIndex);
 
     return angle::Result::Continue;
 }
@@ -2071,28 +2284,318 @@ angle::Result TextureMtl::bindToShaderImage(const gl::Context *context,
                                             int textureSlotIndex,
                                             int level,
                                             int layer,
-                                            GLenum format)
+                                            GLenum format,
+                                            GLenum access)
 {
+    if (mState.getType() == gl::TextureType::Buffer)
+    {
+        MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        ContextMtl *contextMtl = mtl::GetImpl(context);
+        const bool emulateR32fAtomic =
+            contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES &&
+            format == GL_R32F;
+        if (contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES &&
+            (format == GL_R32I || format == GL_R32UI || emulateR32fAtomic))
+        {
+            usage |= MTLTextureUsageShaderAtomic;
+        }
+        const GLenum viewFormat = emulateR32fAtomic ? GL_R32UI : format;
+        mtl::TextureRef texture;
+        ANGLE_TRY(ensureBufferTextureCreated(context, usage, viewFormat, &texture));
+        if (access == GL_READ_ONLY)
+        {
+            cmdEncoder->setTexture(shaderType, texture, textureSlotIndex);
+        }
+        else
+        {
+            cmdEncoder->setRWTexture(shaderType, texture, textureSlotIndex);
+        }
+        return angle::Result::Continue;
+    }
+
     ASSERT(mNativeTextureStorage);
     ASSERT(mState.getImmutableFormat());
     ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
-    ASSERT(0 <= layer && static_cast<uint32_t>(layer) < mSlices);
+    const uint32_t imageLayer = GetImageLayerIndexFrom(
+        gl::ImageIndex::MakeFromType(mState.getType(), level, layer));
+    ASSERT(imageLayer < mSlices);
 
     ContextMtl *contextMtl        = mtl::GetImpl(context);
-    angle::FormatID angleFormatId = angle::Format::InternalFormatToID(format);
-    mtl::Format imageAccessFormat = contextMtl->getPixelFormat(angleFormatId);
+    mtl::Format imageAccessFormat = GetShaderImageAccessFormat(contextMtl, format);
     LayerLevelTextureViewVector &textureViewVector =
         mShaderImageViews[imageAccessFormat.metalFormat];
-    mtl::TextureRef &textureRef = GetLayerLevelTextureView(&textureViewVector, layer, level,
+    mtl::TextureRef &textureRef = GetLayerLevelTextureView(&textureViewVector, imageLayer, level,
                                                            mSlices, mState.getImmutableLevels());
 
     if (textureRef == nullptr)
     {
-        textureRef = mNativeTextureStorage->createShaderImageView2D(level, layer,
+        textureRef = mNativeTextureStorage->createShaderImageView2D(level, imageLayer,
                                                                     imageAccessFormat.metalFormat);
     }
 
     cmdEncoder->setRWTexture(shaderType, textureRef, textureSlotIndex);
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::bindToShaderImage(const gl::Context *context,
+                                            mtl::ComputeCommandEncoder *cmdEncoder,
+                                            int textureSlotIndex,
+                                            int level,
+                                            int layer,
+                                            GLenum format,
+                                            GLenum access)
+{
+    if (mState.getType() == gl::TextureType::Buffer)
+    {
+        MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        ContextMtl *contextMtl = mtl::GetImpl(context);
+        const bool emulateR32fAtomic =
+            contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES &&
+            format == GL_R32F;
+        if (contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES &&
+            (format == GL_R32I || format == GL_R32UI || emulateR32fAtomic))
+        {
+            usage |= MTLTextureUsageShaderAtomic;
+        }
+        const GLenum viewFormat = emulateR32fAtomic ? GL_R32UI : format;
+        mtl::TextureRef texture;
+        ANGLE_TRY(ensureBufferTextureCreated(context, usage, viewFormat, &texture));
+        if (access == GL_READ_ONLY)
+        {
+            cmdEncoder->setTexture(texture, textureSlotIndex);
+        }
+        else
+        {
+            cmdEncoder->setTextureForWrite(texture, textureSlotIndex);
+        }
+        return angle::Result::Continue;
+    }
+
+    ASSERT(mNativeTextureStorage);
+    ASSERT(mState.getImmutableFormat());
+    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
+    const uint32_t imageLayer = GetImageLayerIndexFrom(
+        gl::ImageIndex::MakeFromType(mState.getType(), level, layer));
+    ASSERT(imageLayer < mSlices);
+
+    ContextMtl *contextMtl        = mtl::GetImpl(context);
+    mtl::Format imageAccessFormat = GetShaderImageAccessFormat(contextMtl, format);
+    LayerLevelTextureViewVector &textureViewVector =
+        mShaderImageViews[imageAccessFormat.metalFormat];
+    mtl::TextureRef &textureRef = GetLayerLevelTextureView(&textureViewVector, imageLayer, level,
+                                                           mSlices, mState.getImmutableLevels());
+
+    if (textureRef == nullptr)
+    {
+        textureRef = mNativeTextureStorage->createShaderImageView2D(level, imageLayer,
+                                                                    imageAccessFormat.metalFormat);
+    }
+
+    ASSERT(textureRef && textureRef->get());
+    MTLResourceUsage resourceUsage = MTLResourceUsageRead;
+    if (access == GL_WRITE_ONLY)
+    {
+        resourceUsage = MTLResourceUsageWrite;
+    }
+    else if (access == GL_READ_WRITE)
+    {
+        resourceUsage = MTLResourceUsageRead | MTLResourceUsageWrite;
+    }
+    cmdEncoder->useResource(textureRef, resourceUsage);
+
+    if (access == GL_READ_ONLY)
+    {
+        cmdEncoder->setTexture(textureRef, textureSlotIndex);
+    }
+    else
+    {
+        cmdEncoder->setTextureForWrite(textureRef, textureSlotIndex);
+    }
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::bindToShaderImageAs3D(const gl::Context *context,
+                                                mtl::RenderCommandEncoder *cmdEncoder,
+                                                gl::ShaderType shaderType,
+                                                int textureSlotIndex,
+                                                int level,
+                                                GLenum format,
+                                                GLenum access)
+{
+    ASSERT(mState.getType() == gl::TextureType::_3D);
+    ASSERT(mNativeTextureStorage);
+    ASSERT(mState.getImmutableFormat());
+    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
+
+    ContextMtl *contextMtl        = mtl::GetImpl(context);
+    mtl::Format imageAccessFormat = GetShaderImageAccessFormat(contextMtl, format);
+    TextureViewVector &textureViews = mShaderLayeredImageViews[imageAccessFormat.metalFormat];
+    if (textureViews.empty())
+    {
+        textureViews.resize(mState.getImmutableLevels());
+    }
+    mtl::TextureRef &textureRef = textureViews[level];
+    if (textureRef == nullptr)
+    {
+        textureRef = mNativeTextureStorage->createShaderImageViewLayered(
+            level, imageAccessFormat.metalFormat);
+    }
+
+    if (access == GL_READ_ONLY)
+    {
+        cmdEncoder->setTexture(shaderType, textureRef, textureSlotIndex);
+    }
+    else
+    {
+        cmdEncoder->setRWTexture(shaderType, textureRef, textureSlotIndex);
+    }
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::bindToShaderImageAs3D(const gl::Context *context,
+                                                mtl::ComputeCommandEncoder *cmdEncoder,
+                                                int textureSlotIndex,
+                                                int level,
+                                                GLenum format,
+                                                GLenum access)
+{
+    ASSERT(mState.getType() == gl::TextureType::_3D);
+    ASSERT(mNativeTextureStorage);
+    ASSERT(mState.getImmutableFormat());
+    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
+
+    ContextMtl *contextMtl        = mtl::GetImpl(context);
+    mtl::Format imageAccessFormat = GetShaderImageAccessFormat(contextMtl, format);
+    TextureViewVector &textureViews = mShaderLayeredImageViews[imageAccessFormat.metalFormat];
+    if (textureViews.empty())
+    {
+        textureViews.resize(mState.getImmutableLevels());
+    }
+    mtl::TextureRef &textureRef = textureViews[level];
+    if (textureRef == nullptr)
+    {
+        textureRef = mNativeTextureStorage->createShaderImageViewLayered(
+            level, imageAccessFormat.metalFormat);
+    }
+
+    MTLResourceUsage resourceUsage = MTLResourceUsageRead;
+    if (access == GL_WRITE_ONLY)
+    {
+        resourceUsage = MTLResourceUsageWrite;
+    }
+    else if (access == GL_READ_WRITE)
+    {
+        resourceUsage = MTLResourceUsageRead | MTLResourceUsageWrite;
+    }
+    cmdEncoder->useResource(textureRef, resourceUsage);
+    if (access == GL_READ_ONLY)
+    {
+        cmdEncoder->setTexture(textureRef, textureSlotIndex);
+    }
+    else
+    {
+        cmdEncoder->setTextureForWrite(textureRef, textureSlotIndex);
+    }
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::bindToShaderImageLayered(const gl::Context *context,
+                                                   mtl::RenderCommandEncoder *cmdEncoder,
+                                                   gl::ShaderType shaderType,
+                                                   int textureSlotIndex,
+                                                   int level,
+                                                   gl::TextureType imageType,
+                                                   GLenum format,
+                                                   GLenum access)
+{
+    ASSERT(mNativeTextureStorage);
+    ASSERT(mState.getImmutableFormat());
+    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
+    ASSERT(imageType == gl::TextureType::_2DArray || imageType == gl::TextureType::_3D ||
+           imageType == gl::TextureType::CubeMap);
+    ASSERT(imageType == mState.getType());
+
+    ContextMtl *contextMtl        = mtl::GetImpl(context);
+    mtl::Format imageAccessFormat = GetShaderImageAccessFormat(contextMtl, format);
+    TextureViewVector &textureViews = mShaderLayeredImageViews[imageAccessFormat.metalFormat];
+    if (textureViews.empty())
+    {
+        textureViews.resize(mState.getImmutableLevels());
+    }
+    ASSERT(textureViews.size() > static_cast<size_t>(level));
+
+    mtl::TextureRef &textureRef = textureViews[level];
+    if (textureRef == nullptr)
+    {
+        textureRef = mNativeTextureStorage->createShaderImageViewLayered(
+            level, imageAccessFormat.metalFormat,
+            imageType == gl::TextureType::CubeMap &&
+                contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES);
+    }
+
+    if (access == GL_READ_ONLY)
+    {
+        cmdEncoder->setTexture(shaderType, textureRef, textureSlotIndex);
+    }
+    else
+    {
+        cmdEncoder->setRWTexture(shaderType, textureRef, textureSlotIndex);
+    }
+    return angle::Result::Continue;
+}
+
+angle::Result TextureMtl::bindToShaderImageLayered(const gl::Context *context,
+                                                   mtl::ComputeCommandEncoder *cmdEncoder,
+                                                   int textureSlotIndex,
+                                                   int level,
+                                                   gl::TextureType imageType,
+                                                   GLenum format,
+                                                   GLenum access)
+{
+    ASSERT(mNativeTextureStorage);
+    ASSERT(mState.getImmutableFormat());
+    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
+    ASSERT(imageType == gl::TextureType::_2DArray || imageType == gl::TextureType::_3D ||
+           imageType == gl::TextureType::CubeMap);
+    ASSERT(imageType == mState.getType());
+
+    ContextMtl *contextMtl        = mtl::GetImpl(context);
+    mtl::Format imageAccessFormat = GetShaderImageAccessFormat(contextMtl, format);
+    TextureViewVector &textureViews = mShaderLayeredImageViews[imageAccessFormat.metalFormat];
+    if (textureViews.empty())
+    {
+        textureViews.resize(mState.getImmutableLevels());
+    }
+    ASSERT(textureViews.size() > static_cast<size_t>(level));
+
+    mtl::TextureRef &textureRef = textureViews[level];
+    if (textureRef == nullptr)
+    {
+        textureRef = mNativeTextureStorage->createShaderImageViewLayered(
+            level, imageAccessFormat.metalFormat,
+            imageType == gl::TextureType::CubeMap &&
+                contextMtl->getDisplay()->getNativeExtensions().shaderImageAtomicOES);
+    }
+
+    MTLResourceUsage resourceUsage = MTLResourceUsageRead;
+    if (access == GL_WRITE_ONLY)
+    {
+        resourceUsage = MTLResourceUsageWrite;
+    }
+    else if (access == GL_READ_WRITE)
+    {
+        resourceUsage = MTLResourceUsageRead | MTLResourceUsageWrite;
+    }
+    cmdEncoder->useResource(textureRef, resourceUsage);
+
+    if (access == GL_READ_ONLY)
+    {
+        cmdEncoder->setTexture(textureRef, textureSlotIndex);
+    }
+    else
+    {
+        cmdEncoder->setTextureForWrite(textureRef, textureSlotIndex);
+    }
     return angle::Result::Continue;
 }
 
@@ -2153,28 +2656,43 @@ angle::Result TextureMtl::redefineImage(const gl::Context *context,
             mtlFormat.hasDepthAndStencilBits() ||
             needsFormatViewForPixelLocalStorage(
                 contextMtl->getDisplay()->getNativePixelLocalStorageOptions(), mtlFormat);
+        mtl::Format imageStorageFormat = mtlFormat;
+        const bool useR32FloatAtomicBacking =
+            UsesR32FloatAtomicBacking(contextMtl, mtlFormat);
+        if (useR32FloatAtomicBacking)
+        {
+            imageStorageFormat.metalFormat = MTLPixelFormatR32Uint;
+            allowFormatView              = true;
+        }
+        mtl::TextureRef imageStorage;
         // Create image to hold texture's data at this level & slice:
         switch (index.getType())
         {
             case gl::TextureType::_2D:
             case gl::TextureType::CubeMap:
                 ANGLE_TRY(mtl::Texture::Make2DTexture(
-                    contextMtl, mtlFormat, size.width, size.height, 1,
-                    /** renderTargetOnly */ false, allowFormatView, &imageDef.image));
+                    contextMtl, imageStorageFormat, size.width, size.height, 1,
+                    /** renderTargetOnly */ false, allowFormatView, &imageStorage));
                 break;
             case gl::TextureType::_3D:
                 ANGLE_TRY(mtl::Texture::Make3DTexture(
-                    contextMtl, mtlFormat, size.width, size.height, size.depth, 1,
-                    /** renderTargetOnly */ false, allowFormatView, &imageDef.image));
+                    contextMtl, imageStorageFormat, size.width, size.height, size.depth, 1,
+                    /** renderTargetOnly */ false, allowFormatView, &imageStorage));
                 break;
             case gl::TextureType::_2DArray:
                 ANGLE_TRY(mtl::Texture::Make2DArrayTexture(
-                    contextMtl, mtlFormat, size.width, size.height, 1, size.depth,
-                    /** renderTargetOnly */ false, allowFormatView, &imageDef.image));
+                    contextMtl, imageStorageFormat, size.width, size.height, 1, size.depth,
+                    /** renderTargetOnly */ false, allowFormatView, &imageStorage));
                 break;
             default:
                 UNREACHABLE();
         }
+
+        imageDef.image = useR32FloatAtomicBacking
+                             ? imageStorage->createViewWithDifferentFormat(
+                                   MTLPixelFormatR32Float)
+                             : std::move(imageStorage);
+        ANGLE_CHECK_GL_ALLOC(contextMtl, imageDef.image && imageDef.image->valid());
 
         // Make sure emulated channels are properly initialized in this newly allocated texture.
         ANGLE_TRY(initializeNowIfNeeded(context, mtlFormat, imageDef.image));

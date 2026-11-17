@@ -8,6 +8,8 @@
 //
 
 #include <array>
+#include <sstream>
+#include <string>
 #include <vector>
 #include "common/debug.h"
 #include "common/span.h"
@@ -92,6 +94,2867 @@ class ComputeShaderTestES3 : public ANGLETest<>
   protected:
     ComputeShaderTestES3() {}
 };
+
+class ExperimentalGles31MetalComputeTest : public ANGLETest<>
+{};
+
+PlatformParameters ExperimentalGles31Metal()
+{
+    PlatformParameters params(3, 1, egl_platform::METAL());
+    params.enable(Feature::EnableExperimentalGles31);
+    return params;
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ComputeWorkGroupLimits)
+{
+    GLint maxInvocations = 0;
+    glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &maxInvocations);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_GE(maxInvocations, 128);
+    EXPECT_LE(maxInvocations, 1024);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, DispatchWithUniformsRuntimeArrayAndBarriers)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 4) in;
+layout(std430, binding = 0) buffer Data
+{
+    uint baseValue;
+    uint values[];
+} data;
+uniform uint increment;
+uniform int initializeValues;
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < uint(data.values.length()))
+    {
+        if (initializeValues != 0)
+            data.values[i] = data.baseValue + i * 7u + increment;
+        else
+            data.values[i] += increment;
+    }
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    constexpr GLuint kElementCount = 16;
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (kElementCount + 1) * sizeof(GLuint), nullptr,
+                 GL_DYNAMIC_DRAW);
+    constexpr GLuint kBaseValue = 42;
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(kBaseValue), &kBaseValue);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    glUseProgram(program);
+
+    const GLint incrementLocation = glGetUniformLocation(program, "increment");
+    const GLint initializeLocation = glGetUniformLocation(program, "initializeValues");
+    ASSERT_NE(-1, incrementLocation);
+    ASSERT_NE(-1, initializeLocation);
+
+    glUniform1ui(incrementLocation, 23);
+    glUniform1i(initializeLocation, 1);
+    glDispatchCompute(4, 1, 1);
+    EXPECT_GL_NO_ERROR();
+
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glUniform1ui(incrementLocation, 100);
+    glUniform1i(initializeLocation, 0);
+    glDispatchCompute(4, 1, 1);
+    EXPECT_GL_NO_ERROR();
+
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glFinish();
+    const auto *values = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (kElementCount + 1) * sizeof(GLuint),
+                         GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    for (GLuint i = 0; i < kElementCount; ++i)
+    {
+        EXPECT_EQ(kBaseValue + i * 7 + 123, values[i + 1]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, IndirectDispatchWithGpuGeneratedArguments)
+{
+    constexpr char kGenerateArgsCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer DispatchArguments
+{
+    uint unused;
+    uint groupsX;
+    uint groupsY;
+    uint groupsZ;
+} args;
+void main()
+{
+    args.groupsX = 5u;
+    args.groupsY = 1u;
+    args.groupsZ = 1u;
+})";
+    constexpr char kIndirectCS[]     = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[];
+} outputData;
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    outputData.values[i] = 0xCAFE0000u + i;
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(generateArgsProgram, kGenerateArgsCS);
+    ANGLE_GL_COMPUTE_PROGRAM(indirectProgram, kIndirectCS);
+
+    GLBuffer argumentsBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, argumentsBuffer);
+    const std::array<GLuint, 4> initialArguments = {};
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initialArguments), initialArguments.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, argumentsBuffer);
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, argumentsBuffer);
+
+    glUseProgram(generateArgsProgram);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_GL_NO_ERROR();
+
+    glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
+
+    constexpr GLuint kGroupCount = 5;
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, kGroupCount * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+
+    glUseProgram(indirectProgram);
+    glDispatchComputeIndirect(sizeof(GLuint));
+    EXPECT_GL_NO_ERROR();
+
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glFinish();
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, kGroupCount * sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    for (GLuint i = 0; i < kGroupCount; ++i)
+    {
+        EXPECT_EQ(0xCAFE0000u + i, values[i]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ComputeProgramPipeline)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[];
+} outputData;
+uniform uint baseValue;
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    outputData.values[i] = baseValue + i;
+})";
+
+    GLProgram program;
+    program.makeEmpty();
+    GLShader shader(GL_COMPUTE_SHADER);
+    const char *source = kCS;
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    ASSERT_GL_NO_ERROR();
+    GLint compileStatus = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compileStatus);
+    ASSERT_EQ(GL_TRUE, compileStatus);
+
+    glProgramParameteri(program, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    ASSERT_EQ(GL_TRUE, linkStatus);
+    ASSERT_GL_NO_ERROR();
+    const GLint baseValueLocation = glGetUniformLocation(program, "baseValue");
+    ASSERT_NE(-1, baseValueLocation);
+    glProgramUniform1ui(program, baseValueLocation, 0xBEEF0000u);
+
+    GLProgramPipeline pipeline;
+    glUseProgramStages(pipeline, GL_COMPUTE_SHADER_BIT, program);
+    glUseProgram(0);
+    glBindProgramPipeline(pipeline);
+
+    constexpr GLuint kElementCount = 8;
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, kElementCount * sizeof(GLuint), nullptr,
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+
+    glDispatchCompute(kElementCount, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, kElementCount * sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    for (GLuint i = 0; i < kElementCount; ++i)
+    {
+        EXPECT_EQ(0xBEEF0000u + i, values[i]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsProgramPipeline)
+{
+    constexpr char kVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+layout(location = 0) out vec4 color;
+layout(std430, binding = 0) buffer VertexOutput
+{
+    uint values[];
+} vertexOutput;
+void main()
+{
+    vertexOutput.values[gl_VertexID] = uint(gl_VertexID) + 17u;
+    color = vec4(1.0, 0.0, 0.0, 1.0);
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kFS[] = R"(#version 310 es
+precision highp float;
+layout(location = 0) in vec4 color;
+layout(location = 0) out vec4 fragColor;
+layout(std430, binding = 1) readonly buffer FragmentScale
+{
+    float value;
+} fragmentScale;
+uniform float intensity;
+void main()
+{
+    fragColor = color * fragmentScale.value * intensity;
+})";
+
+    GLProgram vertexProgram;
+    vertexProgram.makeEmpty();
+    GLShader vertexShader(GL_VERTEX_SHADER);
+    const char *vertexSource = kVS;
+    glShaderSource(vertexShader, 1, &vertexSource, nullptr);
+    glCompileShader(vertexShader);
+    ASSERT_GL_NO_ERROR();
+    GLint compileStatus = GL_FALSE;
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &compileStatus);
+    ASSERT_EQ(GL_TRUE, compileStatus);
+    glProgramParameteri(vertexProgram, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glAttachShader(vertexProgram, vertexShader);
+    glLinkProgram(vertexProgram);
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(vertexProgram, GL_LINK_STATUS, &linkStatus);
+    ASSERT_EQ(GL_TRUE, linkStatus);
+
+    GLProgram fragmentProgram;
+    fragmentProgram.makeEmpty();
+    GLShader fragmentShader(GL_FRAGMENT_SHADER);
+    const char *fragmentSource = kFS;
+    glShaderSource(fragmentShader, 1, &fragmentSource, nullptr);
+    glCompileShader(fragmentShader);
+    ASSERT_GL_NO_ERROR();
+    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &compileStatus);
+    ASSERT_EQ(GL_TRUE, compileStatus);
+    glProgramParameteri(fragmentProgram, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glAttachShader(fragmentProgram, fragmentShader);
+    glLinkProgram(fragmentProgram);
+    glGetProgramiv(fragmentProgram, GL_LINK_STATUS, &linkStatus);
+    ASSERT_EQ(GL_TRUE, linkStatus);
+    ASSERT_GL_NO_ERROR();
+    const GLint intensityLocation = glGetUniformLocation(fragmentProgram, "intensity");
+    ASSERT_NE(-1, intensityLocation);
+    glProgramUniform1f(fragmentProgram, intensityLocation, 1.0f);
+
+    GLProgramPipeline pipeline;
+    glUseProgramStages(pipeline, GL_VERTEX_SHADER_BIT, vertexProgram);
+    glUseProgramStages(pipeline, GL_FRAGMENT_SHADER_BIT, fragmentProgram);
+    glBindProgramPipeline(pipeline);
+    glUseProgram(0);
+    ASSERT_GL_NO_ERROR();
+
+    constexpr std::array<GLuint, 6> kInitialVertexOutput = {};
+    GLBuffer vertexOutputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, vertexOutputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(kInitialVertexOutput),
+                 kInitialVertexOutput.data(), GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, vertexOutputBuffer);
+
+    constexpr GLfloat kFragmentScale = 0.5f;
+    GLBuffer fragmentScaleBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fragmentScaleBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(kFragmentScale), &kFragmentScale, GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, fragmentScaleBuffer);
+
+    drawQuadPPO(vertexProgram, "position", 0.0f, 1.0f);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, GLColor(128, 0, 0, 128));
+
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, vertexOutputBuffer);
+    const auto *vertexOutputValues = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(kInitialVertexOutput), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, vertexOutputValues);
+    for (GLuint i = 0; i < kInitialVertexOutput.size(); ++i)
+    {
+        EXPECT_EQ(i + 17u, vertexOutputValues[i]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+
+    glProgramUniform1f(fragmentProgram, intensityLocation, 0.0f);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    drawQuadPPO(vertexProgram, "position", 0.0f, 1.0f);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, GLColor(0, 0, 0, 0));
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, AtomicAddSharedAndStorageBuffer)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 8) in;
+layout(std430, binding = 0) buffer Counters
+{
+    uint deviceCounter;
+    uint sharedResult;
+    uint deviceResult;
+    int sharedCompareSwapResult;
+    uint sharedCompareSwapSuccessCount;
+} counters;
+shared uint sharedCounter;
+shared int sharedCompareSwap;
+void incrementSharedCounter()
+{
+    atomicAdd(sharedCounter, 1u);
+}
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        sharedCounter = 0u;
+        sharedCompareSwap = 0;
+        counters.deviceCounter = 0u;
+    }
+    barrier();
+
+    incrementSharedCounter();
+    atomicAdd(counters.deviceCounter, 1u);
+    int previousCompareSwap = atomicCompSwap(
+        sharedCompareSwap, 0, int(gl_LocalInvocationIndex + 1u));
+    if (previousCompareSwap == 0)
+    {
+        atomicAdd(counters.sharedCompareSwapSuccessCount, 1u);
+    }
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        counters.sharedResult = sharedCounter;
+        counters.deviceResult = counters.deviceCounter;
+        counters.sharedCompareSwapResult = sharedCompareSwap;
+    }
+})";
+
+    GLProgram program;
+    program.makeEmpty();
+    GLShader shader(GL_COMPUTE_SHADER);
+    const char *source = kCS;
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    ASSERT_GL_NO_ERROR();
+    GLint compileStatus = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compileStatus);
+    ASSERT_EQ(GL_TRUE, compileStatus);
+    glAttachShader(program, shader);
+    ASSERT_GL_NO_ERROR();
+    glLinkProgram(program);
+    ASSERT_GL_NO_ERROR();
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    ASSERT_GL_NO_ERROR();
+    if (linkStatus != GL_TRUE)
+    {
+        GLint infoLogLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLogLength);
+        std::string infoLog(static_cast<size_t>(infoLogLength), '\0');
+        GLsizei written = 0;
+        glGetProgramInfoLog(program, infoLogLength, &written, infoLog.data());
+        FAIL() << infoLog;
+    }
+
+    const std::array<GLuint, 5> initialValues = {};
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initialValues), initialValues.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(initialValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    EXPECT_EQ(8u, values[1]);
+    EXPECT_EQ(8u, values[2]);
+    EXPECT_GE(values[3], 1u);
+    EXPECT_LE(values[3], 8u);
+    EXPECT_EQ(1u, values[4]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, AtomicIntegerOperatorsStorageBuffer)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 8) in;
+layout(std430, binding = 0) buffer Results
+{
+    uint sum;
+    uint minimum;
+    uint maximum;
+    uint bitAnd;
+    uint bitOr;
+    uint bitXor;
+    uint exchange;
+    uint compareSwap;
+    uint compareSwapSuccessCount;
+} results;
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        results.sum = 0u;
+        results.minimum = 0xffffffffu;
+        results.maximum = 0u;
+        results.bitAnd = 0xffffffffu;
+        results.bitOr = 0u;
+        results.bitXor = 0u;
+        results.exchange = 0u;
+        results.compareSwap = 0u;
+        results.compareSwapSuccessCount = 0u;
+    }
+    barrier();
+
+    uint value = gl_LocalInvocationIndex + 1u;
+    atomicAdd(results.sum, value);
+    atomicMin(results.minimum, value);
+    atomicMax(results.maximum, value);
+    atomicAnd(results.bitAnd, value);
+    atomicOr(results.bitOr, value);
+    atomicXor(results.bitXor, value);
+    atomicExchange(results.exchange, value);
+    uint previousCompareSwap = atomicCompSwap(results.compareSwap, 0u, value);
+    if (previousCompareSwap == 0u)
+    {
+        atomicAdd(results.compareSwapSuccessCount, 1u);
+    }
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    const std::array<GLuint, 9> initialValues = {};
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initialValues), initialValues.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(initialValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    EXPECT_EQ(36u, values[0]);
+    EXPECT_EQ(1u, values[1]);
+    EXPECT_EQ(8u, values[2]);
+    EXPECT_EQ(0u, values[3]);
+    EXPECT_EQ(15u, values[4]);
+    EXPECT_EQ(8u, values[5]);
+    EXPECT_GE(values[6], 1u);
+    EXPECT_LE(values[6], 8u);
+    EXPECT_GE(values[7], 1u);
+    EXPECT_LE(values[7], 8u);
+    EXPECT_EQ(1u, values[8]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, AtomicCounterBuffer)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 8) in;
+layout(binding = 0, offset = 0) uniform atomic_uint counter0;
+layout(binding = 1, offset = 0) uniform atomic_uint counter1;
+layout(std430, binding = 1) buffer Results
+{
+    uint values[6];
+} results;
+void main()
+{
+    atomicCounterIncrement(counter0);
+    atomicCounterIncrement(counter1);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        results.values[0] = atomicCounter(counter0);
+        results.values[1] = atomicCounterDecrement(counter0);
+        results.values[2] = atomicCounter(counter0);
+        results.values[3] = atomicCounter(counter1);
+        results.values[4] = atomicCounterDecrement(counter1);
+        results.values[5] = atomicCounter(counter1);
+    }
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    const std::array<GLuint, 3> initialCounterValues0 = {0xAAAAAAAAu, 5u, 0xBBBBBBBBu};
+    GLBuffer counterBuffer0;
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, counterBuffer0);
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof(initialCounterValues0),
+                 initialCounterValues0.data(), GL_DYNAMIC_DRAW);
+    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, 0, counterBuffer0, sizeof(GLuint), sizeof(GLuint));
+
+    const std::array<GLuint, 3> initialCounterValues1 = {0xCCCCCCCCu, 9u, 0xDDDDDDDDu};
+    GLBuffer counterBuffer1;
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, counterBuffer1);
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof(initialCounterValues1),
+                 initialCounterValues1.data(), GL_DYNAMIC_DRAW);
+    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, 1, counterBuffer1, sizeof(GLuint), sizeof(GLuint));
+
+    const std::array<GLuint, 6> initialResults = {};
+    GLBuffer resultBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initialResults), initialResults.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, resultBuffer);
+
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_ATOMIC_COUNTER_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+                    GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, counterBuffer0);
+    const auto *counterValues0 = static_cast<const GLuint *>(glMapBufferRange(
+        GL_ATOMIC_COUNTER_BUFFER, 0, sizeof(initialCounterValues0), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, counterValues0);
+    EXPECT_EQ(0xAAAAAAAAu, counterValues0[0]);
+    EXPECT_EQ(12u, counterValues0[1]);
+    EXPECT_EQ(0xBBBBBBBBu, counterValues0[2]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_ATOMIC_COUNTER_BUFFER));
+
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, counterBuffer1);
+    const auto *counterValues1 = static_cast<const GLuint *>(glMapBufferRange(
+        GL_ATOMIC_COUNTER_BUFFER, 0, sizeof(initialCounterValues1), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, counterValues1);
+    EXPECT_EQ(0xCCCCCCCCu, counterValues1[0]);
+    EXPECT_EQ(16u, counterValues1[1]);
+    EXPECT_EQ(0xDDDDDDDDu, counterValues1[2]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_ATOMIC_COUNTER_BUFFER));
+
+    const auto *results = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(initialResults), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, results);
+    EXPECT_EQ(13u, results[0]);
+    EXPECT_EQ(12u, results[1]);
+    EXPECT_EQ(12u, results[2]);
+    EXPECT_EQ(17u, results[3]);
+    EXPECT_EQ(16u, results[4]);
+    EXPECT_EQ(16u, results[5]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsStageAtomicCounterBuffers)
+{
+    GLint maxVertexAtomicCounterBuffers   = 0;
+    GLint maxFragmentAtomicCounterBuffers = 0;
+    glGetIntegerv(GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS, &maxVertexAtomicCounterBuffers);
+    glGetIntegerv(GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS, &maxFragmentAtomicCounterBuffers);
+    ASSERT_GT(maxVertexAtomicCounterBuffers, 0);
+    ASSERT_GT(maxFragmentAtomicCounterBuffers, 0);
+
+    constexpr char kVS[] = R"(#version 310 es
+layout(binding = 0, offset = 0) uniform atomic_uint vertexCounter;
+void main()
+{
+    atomicCounterIncrement(vertexCounter);
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kFS[] = R"(#version 310 es
+precision highp float;
+layout(binding = 1, offset = 0) uniform atomic_uint fragmentCounter;
+layout(location = 0) out vec4 color;
+void main()
+{
+    atomicCounterIncrement(fragmentCounter);
+    color = vec4(1.0, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(program, kVS, kFS);
+
+    const std::array<GLuint, 4> initialValues = {0xAAAAAAAAu, 0u, 0u, 0xBBBBBBBBu};
+    GLBuffer counterBuffer;
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, counterBuffer);
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof(initialValues), initialValues.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, 0, counterBuffer, sizeof(GLuint), sizeof(GLuint));
+    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, 1, counterBuffer, 2 * sizeof(GLuint),
+                      sizeof(GLuint));
+
+    GLTexture colorTexture;
+    glBindTexture(GL_TEXTURE_2D, colorTexture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
+
+    glViewport(0, 0, 1, 1);
+    glUseProgram(program);
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_ATOMIC_COUNTER_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    std::array<GLubyte, 4> pixel = {};
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel.data());
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ(255u, pixel[0]);
+    EXPECT_EQ(0u, pixel[1]);
+    EXPECT_EQ(0u, pixel[2]);
+    EXPECT_EQ(255u, pixel[3]);
+
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_ATOMIC_COUNTER_BUFFER, 0, sizeof(initialValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    EXPECT_EQ(0xAAAAAAAAu, values[0]);
+    EXPECT_EQ(1u, values[1]);
+    EXPECT_EQ(1u, values[2]);
+    EXPECT_EQ(0xBBBBBBBBu, values[3]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_ATOMIC_COUNTER_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, SharedArraysAndStructs)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 4) in;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[];
+} outputData;
+struct SharedValues
+{
+    uint first;
+    uint second;
+};
+shared uint sharedArray[4];
+shared SharedValues sharedValues;
+void writeSharedValues(uint index)
+{
+    sharedArray[index] = index + 10u;
+    if (index == 0u)
+    {
+        sharedValues.first = 42u;
+        sharedValues.second = 99u;
+    }
+}
+void main()
+{
+    writeSharedValues(gl_LocalInvocationIndex);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        outputData.values[0] = sharedArray[3];
+        outputData.values[1] = sharedValues.first;
+        outputData.values[2] = sharedValues.second;
+    }
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    const std::array<GLuint, 3> initialValues = {};
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initialValues), initialValues.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(initialValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    EXPECT_EQ(13u, values[0]);
+    EXPECT_EQ(42u, values[1]);
+    EXPECT_EQ(99u, values[2]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, NestedSharedStructArrays)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 4) in;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[];
+} outputData;
+struct SharedInner
+{
+    uint scalar;
+    uvec2 pair;
+};
+struct SharedOuter
+{
+    SharedInner inner[2];
+    uint tail[2];
+};
+shared SharedOuter sharedValues[2];
+void writeSharedValues(uint index)
+{
+    uint outerIndex = index / 2u;
+    uint innerIndex = index % 2u;
+    sharedValues[outerIndex].inner[innerIndex].scalar = index + 10u;
+    sharedValues[outerIndex].inner[innerIndex].pair = uvec2(index + 20u, index + 30u);
+    sharedValues[outerIndex].tail[innerIndex] = index + 40u;
+}
+void main()
+{
+    uint index = gl_LocalInvocationIndex;
+    writeSharedValues(index);
+    barrier();
+    if (index == 0u)
+    {
+        outputData.values[0] = sharedValues[0].inner[1].scalar;
+        outputData.values[1] = sharedValues[0].inner[1].pair.x;
+        outputData.values[2] = sharedValues[0].inner[1].pair.y;
+        outputData.values[3] = sharedValues[0].tail[1];
+        outputData.values[4] = sharedValues[1].inner[1].scalar;
+        outputData.values[5] = sharedValues[1].inner[1].pair.x;
+        outputData.values[6] = sharedValues[1].inner[1].pair.y;
+        outputData.values[7] = sharedValues[1].tail[1];
+    }
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    const std::array<GLuint, 8> initialValues = {};
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initialValues), initialValues.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *values = static_cast<const GLuint *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(initialValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, values);
+    EXPECT_EQ(11u, values[0]);
+    EXPECT_EQ(21u, values[1]);
+    EXPECT_EQ(31u, values[2]);
+    EXPECT_EQ(41u, values[3]);
+    EXPECT_EQ(13u, values[4]);
+    EXPECT_EQ(23u, values[5]);
+    EXPECT_EQ(33u, values[6]);
+    EXPECT_EQ(43u, values[7]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, SharedMemoryLimitCountsAllVariables)
+{
+    GLint maxSharedMemorySize = 0;
+    glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &maxSharedMemorySize);
+    ASSERT_GT(maxSharedMemorySize, 0);
+
+    const GLint maxSharedUintCount     = maxSharedMemorySize / sizeof(GLuint);
+    const GLint halfMaxSharedUintCount = maxSharedUintCount / 2;
+
+    std::ostringstream shaderSource;
+    shaderSource << "#version 310 es\n"
+                 << "layout(local_size_x = 1) in;\n"
+                 << "shared uint first[" << halfMaxSharedUintCount << "];\n"
+                 << "shared uint second[" << (maxSharedUintCount - halfMaxSharedUintCount)
+                 << "];\n"
+                 << "shared uint extra;\n"
+                 << "void main() { first[0] = second[0] = extra = 0u; barrier(); }\n";
+
+    const char kOverflowShader[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+shared uint oversized[1073741825];
+void main() { oversized[0] = 0u; barrier(); }
+)";
+
+    auto expectSharedMemoryLimitError = [](const std::string &sourceString) {
+        const char *source = sourceString.c_str();
+        GLShader shader(GL_COMPUTE_SHADER);
+        glShaderSource(shader, 1, &source, nullptr);
+        glCompileShader(shader);
+
+        GLint compileStatus = GL_TRUE;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &compileStatus);
+        EXPECT_EQ(GL_FALSE, compileStatus);
+
+        GLint infoLogLength = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &infoLogLength);
+        ASSERT_GT(infoLogLength, 0);
+        std::string infoLog(infoLogLength, '\0');
+        glGetShaderInfoLog(shader, infoLogLength, nullptr, infoLog.data());
+        EXPECT_NE(std::string::npos,
+                  infoLog.find("Shared memory size exceeds GL_MAX_COMPUTE_SHARED_MEMORY_SIZE"));
+    };
+
+    expectSharedMemoryLimitError(shaderSource.str());
+    expectSharedMemoryLimitError(kOverflowShader);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ImageLoadStore)
+{
+    constexpr char kCS[]     = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp writeonly uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[];
+} outputData;
+void main()
+{
+    ivec2 coord = ivec2(gl_GlobalInvocationID.x, 0);
+    uint value = 109u + gl_GlobalInvocationID.x;
+    outputData.values[gl_GlobalInvocationID.x] = value;
+    imageStore(image, coord, uvec4(value));
+})";
+    constexpr char kReadCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp readonly uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[];
+} outputData;
+void main()
+{
+    ivec2 coord = ivec2(gl_GlobalInvocationID.x, 0);
+    outputData.values[gl_GlobalInvocationID.x] = imageLoad(image, coord).x;
+})";
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+    ANGLE_GL_COMPUTE_PROGRAM(readProgram, kReadCS);
+
+    constexpr GLuint kWidth = 8;
+    GLBuffer buffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, kWidth * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+
+    GLTexture texture;
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, kWidth, 1);
+    glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glUseProgram(program);
+    glDispatchCompute(kWidth, 1, 1);
+    EXPECT_GL_NO_ERROR();
+
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    const auto *bufferValues = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, kWidth * sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, bufferValues);
+    for (GLuint i = 0; i < kWidth; ++i)
+    {
+        EXPECT_EQ(109 + i, bufferValues[i]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+
+    glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
+    glUseProgram(readProgram);
+    glDispatchCompute(kWidth, 1, 1);
+    EXPECT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *outputValues = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, kWidth * sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, outputValues);
+    for (GLuint i = 0; i < kWidth; ++i)
+    {
+        EXPECT_EQ(109 + i, outputValues[i]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicIntegerOperations)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32i, binding = 0) uniform highp iimage2D signedImage;
+layout(r32ui, binding = 1) uniform highp uimage2D unsignedImage;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[34];
+} outputData;
+void main()
+{
+    outputData.values[0] = uint(imageAtomicAdd(signedImage, ivec2(0, 0), -2));
+    outputData.values[1] = uint(imageAtomicMin(signedImage, ivec2(1, 0), -7));
+    outputData.values[2] = uint(imageAtomicMax(signedImage, ivec2(2, 0), 9));
+    outputData.values[3] = uint(imageAtomicAnd(signedImage, ivec2(3, 0), 0x3c));
+    outputData.values[4] = uint(imageAtomicOr(signedImage, ivec2(4, 0), 0x0c));
+    outputData.values[5] = uint(imageAtomicXor(signedImage, ivec2(5, 0), 0x0f));
+    outputData.values[6] = uint(imageAtomicExchange(signedImage, ivec2(6, 0), -11));
+    outputData.values[7] = uint(imageAtomicCompSwap(signedImage, ivec2(7, 0), 42, -15));
+
+    outputData.values[8] = imageAtomicAdd(unsignedImage, ivec2(0, 0), 7u);
+    outputData.values[9] = imageAtomicMin(unsignedImage, ivec2(1, 0), 2u);
+    outputData.values[10] = imageAtomicMax(unsignedImage, ivec2(2, 0), 9u);
+    outputData.values[11] = imageAtomicAnd(unsignedImage, ivec2(3, 0), 0x3cu);
+    outputData.values[12] = imageAtomicOr(unsignedImage, ivec2(4, 0), 0x0cu);
+    outputData.values[13] = imageAtomicXor(unsignedImage, ivec2(5, 0), 0x0fu);
+    outputData.values[14] = imageAtomicExchange(unsignedImage, ivec2(6, 0), 23u);
+    outputData.values[15] = imageAtomicCompSwap(unsignedImage, ivec2(7, 0), 42u, 99u);
+    outputData.values[32] = uint(imageAtomicAdd(signedImage, ivec2(-1, 0), 1));
+    outputData.values[33] = imageAtomicAdd(unsignedImage, ivec2(8, 0), 1u);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        outputData.values[16 + i] = uint(imageLoad(signedImage, ivec2(i, 0)).r);
+        outputData.values[24 + i] = imageLoad(unsignedImage, ivec2(i, 0)).r;
+    }
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    constexpr std::array<GLint, 8> kSignedInitial    = {5, 5, 5, 0xf0, 0x30, 0xff, 17, 42};
+    constexpr std::array<GLuint, 8> kUnsignedInitial = {5u, 5u, 5u, 0xf0u, 0x30u, 0xffu, 17u, 42u};
+    GLTexture signedImage;
+    glBindTexture(GL_TEXTURE_2D, signedImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32I, kSignedInitial.size(), 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kSignedInitial.size(), 1, GL_RED_INTEGER, GL_INT,
+                    kSignedInitial.data());
+    GLTexture unsignedImage;
+    glBindTexture(GL_TEXTURE_2D, unsignedImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, kUnsignedInitial.size(), 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kUnsignedInitial.size(), 1, GL_RED_INTEGER,
+                    GL_UNSIGNED_INT, kUnsignedInitial.data());
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 34 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, signedImage, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32I);
+    glBindImageTexture(1, unsignedImage, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    constexpr std::array<GLuint, 34> kExpected = {
+        5u,
+        5u,
+        5u,
+        0xf0u,
+        0x30u,
+        0xffu,
+        17u,
+        42u,
+        5u,
+        5u,
+        5u,
+        0xf0u,
+        0x30u,
+        0xffu,
+        17u,
+        42u,
+        3u,
+        static_cast<GLuint>(-7),
+        9u,
+        0x30u,
+        0x3cu,
+        0xf0u,
+        static_cast<GLuint>(-11),
+        static_cast<GLuint>(-15),
+        12u,
+        2u,
+        9u,
+        0x30u,
+        0x3cu,
+        0xf0u,
+        23u,
+        99u,
+        0u,
+        0u,
+    };
+    const auto *actual = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(kExpected), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    for (size_t i = 0; i < kExpected.size(); ++i)
+    {
+        EXPECT_EQ(kExpected[i], actual[i]) << "atomic result/final texel index " << i;
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicExchangeR32F)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32f, binding = 0) uniform highp image2D floatImage;
+layout(std430, binding = 0) buffer Output
+{
+    vec2 values;
+} outputData;
+void main()
+{
+    outputData.values.x = imageAtomicExchange(floatImage, ivec2(0), 2.5);
+    outputData.values.y = imageLoad(floatImage, ivec2(0)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    constexpr GLfloat kInitialValue = 1.25f;
+    GLTexture floatImage;
+    glBindTexture(GL_TEXTURE_2D, floatImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 1, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED, GL_FLOAT, &kInitialValue);
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * sizeof(GLfloat), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, floatImage, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    const auto *actual = static_cast<const GLfloat *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 2 * sizeof(GLfloat), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    EXPECT_FLOAT_EQ(1.25f, actual[0]);
+    EXPECT_FLOAT_EQ(2.5f, actual[1]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicExchangeR32FReturnImage)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kAtomicCS[]   = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 5) in;
+layout(r32f, binding = 0) coherent uniform highp image2D sourceImage;
+layout(r32f, binding = 1) writeonly uniform highp image2D returnImage;
+void main()
+{
+    int x = int(gl_GlobalInvocationID.x);
+    float value = float(x * 4096);
+    imageStore(returnImage, ivec2(x, 0),
+               vec4(imageAtomicExchange(sourceImage, ivec2(0), value)));
+})";
+    constexpr char kReadbackCS[] = R"(#version 310 es
+layout(local_size_x = 5) in;
+uniform highp sampler2D returnTexture;
+layout(std430, binding = 0) buffer Output
+{
+    float values[5];
+} outputData;
+void main()
+{
+    int x = int(gl_GlobalInvocationID.x);
+    outputData.values[x] = texelFetch(returnTexture, ivec2(x, 0), 0).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(atomicProgram, kAtomicCS);
+    ANGLE_GL_COMPUTE_PROGRAM(readbackProgram, kReadbackCS);
+
+    constexpr GLfloat kInitialValue = 18.0f;
+    GLTexture sourceImage;
+    glBindTexture(GL_TEXTURE_2D, sourceImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 1, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED, GL_FLOAT, &kInitialValue);
+
+    GLTexture returnImage;
+    glBindTexture(GL_TEXTURE_2D, returnImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 5, 1);
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 5 * sizeof(GLfloat), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+
+    glBindImageTexture(0, sourceImage, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
+    glBindImageTexture(1, returnImage, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F);
+    glUseProgram(atomicProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, returnImage);
+    glUseProgram(readbackProgram);
+    glUniform1i(glGetUniformLocation(readbackProgram, "returnTexture"), 0);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *actual = static_cast<const GLfloat *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 5 * sizeof(GLfloat), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+
+    const auto initialValue = std::find(actual, actual + 5, kInitialValue);
+    ASSERT_NE(actual + 5, initialValue)
+        << "return values: " << actual[0] << ", " << actual[1] << ", " << actual[2] << ", "
+        << actual[3] << ", " << actual[4];
+    EXPECT_EQ(1, std::count(actual, actual + 5, kInitialValue));
+    constexpr std::array<GLfloat, 5> kAtomicValues = {0.0f, 4096.0f, 8192.0f, 12288.0f, 16384.0f};
+    std::array<bool, kAtomicValues.size()> seenValues = {};
+    size_t returnedAtomicValues                       = 0;
+    for (size_t i = 0; i < 5; ++i)
+    {
+        if (actual[i] == kInitialValue)
+        {
+            continue;
+        }
+        const auto value = std::find(kAtomicValues.begin(), kAtomicValues.end(), actual[i]);
+        ASSERT_NE(kAtomicValues.end(), value) << "unexpected atomic return value " << actual[i];
+        const size_t valueIndex = static_cast<size_t>(value - kAtomicValues.begin());
+        EXPECT_FALSE(seenValues[valueIndex]) << "duplicate atomic return value " << actual[i];
+        seenValues[valueIndex] = true;
+        ++returnedAtomicValues;
+    }
+    EXPECT_EQ(4u, returnedAtomicValues);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicLayeredImageTypes)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp uimage2DArray arrayImage;
+layout(r32ui, binding = 1) uniform highp uimage3D volumeImage;
+layout(r32ui, binding = 2) uniform highp uimageCube cubeImage;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[6];
+} outputData;
+void main()
+{
+    ivec3 arrayCoord = ivec3(0, 0, 1);
+    ivec3 image3DCoord = ivec3(0, 0, 1);
+    ivec3 cubeCoord = ivec3(0, 0, 4);
+    outputData.values[0] = imageAtomicAdd(arrayImage, arrayCoord, 10u);
+    outputData.values[1] = imageLoad(arrayImage, arrayCoord).r;
+    outputData.values[2] = imageAtomicAdd(volumeImage, image3DCoord, 10u);
+    outputData.values[3] = imageLoad(volumeImage, image3DCoord).r;
+    outputData.values[4] = imageAtomicAdd(cubeImage, cubeCoord, 10u);
+    outputData.values[5] = imageLoad(cubeImage, cubeCoord).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    GLTexture arrayImage;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, arrayImage);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R32UI, 1, 1, 2);
+    constexpr std::array<GLuint, 2> kArrayInitial = {3u, 4u};
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 1, 1, kArrayInitial.size(), GL_RED_INTEGER,
+                    GL_UNSIGNED_INT, kArrayInitial.data());
+
+    GLTexture image3D;
+    glBindTexture(GL_TEXTURE_3D, image3D);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 2);
+    constexpr std::array<GLuint, 2> kImage3DInitial = {5u, 6u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, kImage3DInitial.size(), GL_RED_INTEGER,
+                    GL_UNSIGNED_INT, kImage3DInitial.data());
+
+    GLTexture cubeImage;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubeImage);
+    glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32UI, 1, 1);
+    constexpr std::array<GLuint, 6> kCubeInitial = {0u, 0u, 0u, 0u, 7u, 0u};
+    for (size_t face = 0; face < kCubeInitial.size(); ++face)
+    {
+        glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), 0, 0, 0, 1, 1,
+                        GL_RED_INTEGER, GL_UNSIGNED_INT, &kCubeInitial[face]);
+    }
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 6 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, arrayImage, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+    glBindImageTexture(1, image3D, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+    glBindImageTexture(2, cubeImage, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    constexpr std::array<GLuint, 6> kExpected = {4u, 14u, 6u, 16u, 7u, 17u};
+    const auto *actual                        = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(kExpected), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    for (size_t i = 0; i < kExpected.size(); ++i)
+    {
+        EXPECT_EQ(kExpected[i], actual[i]) << "layered image result index " << i;
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicNonLayered3DSlice)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[2];
+} outputData;
+void main()
+{
+    outputData.values[0] = imageAtomicAdd(image, ivec2(0), 13u);
+    outputData.values[1] = imageLoad(image, ivec2(0)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    GLTexture texture3D;
+    glBindTexture(GL_TEXTURE_3D, texture3D);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 2);
+    constexpr std::array<GLuint, 2> kInitialValues = {23u, 29u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, kInitialValues.size(), GL_RED_INTEGER,
+                    GL_UNSIGNED_INT, kInitialValues.data());
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, texture3D, 0, GL_FALSE, 1, GL_READ_WRITE, GL_R32UI);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    constexpr std::array<GLuint, 2> kExpected = {29u, 42u};
+    const auto *actual                        = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(kExpected), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    EXPECT_EQ(kExpected[0], actual[0]);
+    EXPECT_EQ(kExpected[1], actual[1]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicGraphicsStages)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kAtomicVS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(r32ui, binding = 0) uniform highp uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[2];
+} outputData;
+void main()
+{
+    outputData.values[0] = imageAtomicAdd(image, ivec2(0), 2u);
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kAtomicFS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+precision highp float;
+layout(r32ui, binding = 0) uniform highp uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[2];
+} outputData;
+out vec4 color;
+void main()
+{
+    outputData.values[1] = imageAtomicAdd(image, ivec2(0), 3u);
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    constexpr char kPlainVS[]  = R"(#version 310 es
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kPlainFS[]  = R"(#version 310 es
+precision highp float;
+out vec4 color;
+void main()
+{
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(vertexAtomicProgram, kAtomicVS, kPlainFS);
+    ANGLE_GL_PROGRAM(fragmentAtomicProgram, kPlainVS, kAtomicFS);
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D, image);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
+    constexpr GLuint kInitialValue = 10u;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &kInitialValue);
+    glBindImageTexture(0, image, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+
+    GLTexture framebufferTexture;
+    glBindTexture(GL_TEXTURE_2D, framebufferTexture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, framebufferTexture,
+                           0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
+    glViewport(0, 0, 1, 1);
+
+    glUseProgram(vertexAtomicProgram);
+    glDrawArrays(GL_POINTS, 0, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    glUseProgram(fragmentAtomicProgram);
+    glDrawArrays(GL_POINTS, 0, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    const auto *actual = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 2 * sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    EXPECT_EQ(10u, actual[0]);
+    EXPECT_EQ(12u, actual[1]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicConcurrentAdd)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kAtomicCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 64) in;
+layout(r32ui, binding = 0) uniform highp uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[65];
+} outputData;
+void main()
+{
+    uint invocation = gl_LocalInvocationIndex;
+    outputData.values[invocation] = imageAtomicAdd(image, ivec2(0), 1u);
+})";
+    constexpr char kReadCS[]   = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp readonly uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint values[65];
+} outputData;
+void main()
+{
+    outputData.values[64] = imageLoad(image, ivec2(0)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(atomicProgram, kAtomicCS);
+    ANGLE_GL_COMPUTE_PROGRAM(readProgram, kReadCS);
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D, image);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
+    constexpr GLuint kInitialValue = 0;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &kInitialValue);
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 65 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, image, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+    glUseProgram(atomicProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    glBindImageTexture(0, image, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32UI);
+    glUseProgram(readProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *actual = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 65 * sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    std::array<bool, 64> seen = {};
+    for (GLuint i = 0; i < seen.size(); ++i)
+    {
+        ASSERT_LT(actual[i], seen.size());
+        EXPECT_FALSE(seen[actual[i]]) << "duplicate atomic return value " << actual[i];
+        seen[actual[i]] = true;
+    }
+    EXPECT_EQ(64u, actual[64]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageStoreBarrierThenAtomicAdd)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kStoreAndAddCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 8) in;
+layout(r32ui, binding = 0) uniform highp uimage2D image;
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        imageStore(image, ivec2(0), uvec4(0u));
+    barrier();
+    imageAtomicAdd(image, ivec2(0), 1u);
+})";
+    constexpr char kReadCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp readonly uimage2D image;
+layout(std430, binding = 0) buffer Output
+{
+    uint value;
+} outputData;
+void main()
+{
+    outputData.value = imageLoad(image, ivec2(0)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(storeAndAddProgram, kStoreAndAddCS);
+    ANGLE_GL_COMPUTE_PROGRAM(readProgram, kReadCS);
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D, image);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
+    constexpr GLuint kInitialValue = 0;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    &kInitialValue);
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glUseProgram(storeAndAddProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
+    glUseProgram(readProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    const auto *actual = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    EXPECT_EQ(8u, actual[0]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicExchangeR32FLayeredTypes)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32f, binding = 0) uniform highp image2DArray arrayImage;
+layout(r32f, binding = 1) uniform highp image3D volumeImage;
+layout(r32f, binding = 2) uniform highp imageCube cubeImage;
+layout(std430, binding = 0) buffer Output
+{
+    float values[6];
+} outputData;
+void main()
+{
+    ivec3 coord = ivec3(0, 0, 1);
+    outputData.values[0] = imageAtomicExchange(arrayImage, coord, 2.5);
+    outputData.values[1] = imageLoad(arrayImage, coord).r;
+    outputData.values[2] = imageAtomicExchange(volumeImage, coord, 4.5);
+    outputData.values[3] = imageLoad(volumeImage, coord).r;
+    outputData.values[4] = imageAtomicExchange(cubeImage, ivec3(0, 0, 4), 6.5);
+    outputData.values[5] = imageLoad(cubeImage, ivec3(0, 0, 4)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    GLTexture arrayImage;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, arrayImage);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R32F, 1, 1, 2);
+    constexpr std::array<GLfloat, 2> kArrayInitial = {0.25f, 1.25f};
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 1, 1, kArrayInitial.size(), GL_RED, GL_FLOAT,
+                    kArrayInitial.data());
+
+    GLTexture volumeImage;
+    glBindTexture(GL_TEXTURE_3D, volumeImage);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32F, 1, 1, 2);
+    constexpr std::array<GLfloat, 2> kVolumeInitial = {0.5f, 3.5f};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, kVolumeInitial.size(), GL_RED, GL_FLOAT,
+                    kVolumeInitial.data());
+
+    GLTexture cubeImage;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubeImage);
+    glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32F, 1, 1);
+    constexpr std::array<GLfloat, 6> kCubeInitial = {0.0f, 0.0f, 0.0f, 0.0f, 5.5f, 0.0f};
+    for (size_t face = 0; face < kCubeInitial.size(); ++face)
+    {
+        glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), 0, 0, 0, 1, 1,
+                        GL_RED, GL_FLOAT, &kCubeInitial[face]);
+    }
+
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 6 * sizeof(GLfloat), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, arrayImage, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
+    glBindImageTexture(1, volumeImage, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
+    glBindImageTexture(2, cubeImage, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    constexpr std::array<GLfloat, 6> kExpected = {1.25f, 2.5f, 3.5f, 4.5f, 5.5f, 6.5f};
+    const auto *actual                         = static_cast<const GLfloat *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(kExpected), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    for (size_t i = 0; i < kExpected.size(); ++i)
+    {
+        EXPECT_FLOAT_EQ(kExpected[i], actual[i]) << "R32F atomic exchange value index " << i;
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderImageAtomicExchangeR32FNonLayered3DSlice)
+{
+    ASSERT_TRUE(IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kCS[] = R"(#version 310 es
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32f, binding = 0) uniform highp image2D sliceImage;
+layout(std430, binding = 0) buffer Output
+{
+    vec2 values;
+} outputData;
+void main()
+{
+    outputData.values.x = imageAtomicExchange(sliceImage, ivec2(0), 8.5);
+    outputData.values.y = imageLoad(sliceImage, ivec2(0)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    GLTexture texture3D;
+    glBindTexture(GL_TEXTURE_3D, texture3D);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32F, 1, 1, 2);
+    constexpr std::array<GLfloat, 2> kInitialValues = {6.5f, 7.5f};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, kInitialValues.size(), GL_RED, GL_FLOAT,
+                    kInitialValues.data());
+    ASSERT_GL_NO_ERROR();
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * sizeof(GLfloat), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, texture3D, 0, GL_FALSE, 1, GL_READ_WRITE, GL_R32F);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    const auto *actual = static_cast<const GLfloat *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 2 * sizeof(GLfloat), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    EXPECT_FLOAT_EQ(7.5f, actual[0]);
+    EXPECT_FLOAT_EQ(8.5f, actual[1]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ImageUniformArray)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) writeonly uniform highp uimage2D images[2];
+void main()
+{
+    imageStore(images[0], ivec2(0), uvec4(11u));
+    imageStore(images[1], ivec2(0), uvec4(13u));
+})";
+    GLuint computeShader = CompileShader(GL_COMPUTE_SHADER, kCS);
+    ASSERT_NE(0u, computeShader);
+    ASSERT_GL_NO_ERROR();
+    GLuint program = glCreateProgram();
+    ASSERT_NE(0u, program);
+    glAttachShader(program, computeShader);
+    glLinkProgram(program);
+    ASSERT_GL_NO_ERROR();
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    if (linkStatus != GL_TRUE)
+    {
+        GLint infoLogLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLogLength);
+        std::vector<GLchar> infoLog(static_cast<size_t>(std::max(infoLogLength, 1)));
+        glGetProgramInfoLog(program, static_cast<GLsizei>(infoLog.size()), nullptr, infoLog.data());
+        FAIL() << "Program link failed: " << infoLog.data();
+    }
+
+    GLTexture image0;
+    glBindTexture(GL_TEXTURE_2D, image0);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
+    GLTexture image1;
+    glBindTexture(GL_TEXTURE_2D, image1);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
+    glBindImageTexture(0, image0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glBindImageTexture(1, image1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image0, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    GLuint firstValue = 0;
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &firstValue);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image1, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    GLuint secondValue = 0;
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &secondValue);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ(11u, firstValue);
+    EXPECT_EQ(13u, secondValue);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, LayeredImage2DArrayLoadStore)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(r32ui, binding = 0) uniform highp uimage2DArray image;
+void main()
+{
+    ivec3 coord = ivec3(0, 0, int(gl_GlobalInvocationID.z));
+    uint value = imageLoad(image, coord).r;
+    imageStore(image, coord, uvec4(value + uint(imageSize(image).z)));
+})";
+    GLuint computeShader = CompileShader(GL_COMPUTE_SHADER, kCS);
+    ASSERT_NE(0u, computeShader);
+    ASSERT_GL_NO_ERROR();
+    GLuint program = glCreateProgram();
+    ASSERT_NE(0u, program);
+    glAttachShader(program, computeShader);
+    glLinkProgram(program);
+    ASSERT_GL_NO_ERROR();
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    if (linkStatus != GL_TRUE)
+    {
+        GLint infoLogLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLogLength);
+        std::vector<GLchar> infoLog(static_cast<size_t>(std::max(infoLogLength, 1)));
+        glGetProgramInfoLog(program, static_cast<GLsizei>(infoLog.size()), nullptr, infoLog.data());
+        FAIL() << "Program link failed: " << infoLog.data();
+    }
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, image);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R32UI, 1, 1, 3);
+    const std::array<GLuint, 3> initialValues = {3u, 5u, 7u};
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 1, 1, 3, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    initialValues.data());
+    glBindImageTexture(0, image, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 3);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    std::array<GLuint, 3> resultValues = {};
+    for (GLint layer = 0; layer < 3; ++layer)
+    {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, image, 0, layer);
+        ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+        glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     &resultValues[static_cast<size_t>(layer)]);
+    }
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 3>{6u, 8u, 10u}), resultValues);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, LayeredImage3DLoadStore)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(r32ui, binding = 0) uniform highp uimage3D image;
+void main()
+{
+    ivec3 coord = ivec3(0, 0, int(gl_GlobalInvocationID.z));
+    uint value = imageLoad(image, coord).r;
+    imageStore(image, coord, uvec4(value + uint(imageSize(image).z)));
+})";
+    GLuint computeShader = CompileShader(GL_COMPUTE_SHADER, kCS);
+    ASSERT_NE(0u, computeShader);
+    ASSERT_GL_NO_ERROR();
+    GLuint program = glCreateProgram();
+    ASSERT_NE(0u, program);
+    glAttachShader(program, computeShader);
+    glLinkProgram(program);
+    ASSERT_GL_NO_ERROR();
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    if (linkStatus != GL_TRUE)
+    {
+        GLint infoLogLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLogLength);
+        std::vector<GLchar> infoLog(static_cast<size_t>(std::max(infoLogLength, 1)));
+        glGetProgramInfoLog(program, static_cast<GLsizei>(infoLog.size()), nullptr, infoLog.data());
+        FAIL() << "Program link failed: " << infoLog.data();
+    }
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_3D, image);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 3);
+    const std::array<GLuint, 3> initialValues = {3u, 5u, 7u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, 3, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    initialValues.data());
+    glBindImageTexture(0, image, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 3);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    std::array<GLuint, 3> resultValues = {};
+    for (GLint layer = 0; layer < 3; ++layer)
+    {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, image, 0, layer);
+        ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+        glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     &resultValues[static_cast<size_t>(layer)]);
+    }
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 3>{6u, 8u, 10u}), resultValues);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, NonLayeredImage2DTexture3DSliceLoadStore)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) readonly uniform highp uimage2D sourceImage;
+layout(r32ui, binding = 1) writeonly uniform highp uimage2D destinationImage;
+void main()
+{
+    uint value = imageLoad(sourceImage, ivec2(0)).r;
+    imageStore(destinationImage, ivec2(0), uvec4(value + 9u));
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    GLTexture source;
+    GLTexture destination;
+    glBindTexture(GL_TEXTURE_3D, source);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 3);
+    const std::array<GLuint, 3> sourceValues = {17u, 29u, 41u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, 3, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    sourceValues.data());
+    glBindTexture(GL_TEXTURE_3D, destination);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 3);
+    const std::array<GLuint, 3> initialValues = {3u, 5u, 7u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, 3, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    initialValues.data());
+    ASSERT_GL_NO_ERROR();
+
+    glBindImageTexture(0, source, 0, GL_FALSE, 2, GL_READ_ONLY, GL_R32UI);
+    glBindImageTexture(1, destination, 0, GL_FALSE, 1, GL_WRITE_ONLY, GL_R32UI);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    std::array<GLuint, 3> resultValues = {};
+    for (GLint layer = 0; layer < 3; ++layer)
+    {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, destination, 0, layer);
+        ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+        glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     &resultValues[static_cast<size_t>(layer)]);
+    }
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 3>{3u, 50u, 7u}), resultValues);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ImageHelperFunctionParameter3DSliceLoadStore)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp uimage2D images[2];
+layout(std430, binding = 0) buffer Output
+{
+    uint loadedValue;
+} outputData;
+
+uint loadFromImage(highp uimage2D sourceImage)
+{
+    return imageLoad(sourceImage, ivec2(0)).r + uint(imageSize(sourceImage).x);
+}
+
+void storeToImage(highp uimage2D destinationImage, uint value)
+{
+    imageStore(destinationImage, ivec2(0), uvec4(value));
+}
+
+void main()
+{
+    uint value = loadFromImage(images[0]);
+    outputData.loadedValue = value;
+    storeToImage(images[1], value + 1u);
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    GLTexture source;
+    GLTexture destination;
+    glBindTexture(GL_TEXTURE_3D, source);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 3);
+    const std::array<GLuint, 3> sourceValues = {17u, 29u, 41u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, 3, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    sourceValues.data());
+    glBindTexture(GL_TEXTURE_3D, destination);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 3);
+    const std::array<GLuint, 3> destinationValues = {3u, 5u, 7u};
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, 3, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    destinationValues.data());
+    GLBuffer output;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, output);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    ASSERT_GL_NO_ERROR();
+
+    glBindImageTexture(0, source, 0, GL_FALSE, 2, GL_READ_ONLY, GL_R32UI);
+    glBindImageTexture(1, destination, 0, GL_FALSE, 1, GL_WRITE_ONLY, GL_R32UI);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, output);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+                    GL_FRAMEBUFFER_BARRIER_BIT);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, output);
+    const GLuint *loadedValue = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(GLuint), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, loadedValue);
+    const GLuint loaded = *loadedValue;
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    std::array<GLuint, 3> resultValues = {};
+    for (GLint layer = 0; layer < 3; ++layer)
+    {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, destination, 0, layer);
+        ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+        glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                     &resultValues[static_cast<size_t>(layer)]);
+    }
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ(42u, loaded);
+    EXPECT_EQ((std::array<GLuint, 3>{3u, 43u, 7u}), resultValues);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, LayeredImageCubeLoadStore)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(r32ui, binding = 0) uniform highp uimageCube image;
+void main()
+{
+    ivec3 coord = ivec3(0, 0, int(gl_GlobalInvocationID.z));
+    uint value = imageLoad(image, coord).r;
+    imageStore(image, coord, uvec4(value + uint(imageSize(image).x)));
+})";
+    GLuint computeShader = CompileShader(GL_COMPUTE_SHADER, kCS);
+    ASSERT_NE(0u, computeShader);
+    ASSERT_GL_NO_ERROR();
+    GLuint program = glCreateProgram();
+    ASSERT_NE(0u, program);
+    glAttachShader(program, computeShader);
+    glLinkProgram(program);
+    ASSERT_GL_NO_ERROR();
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    if (linkStatus != GL_TRUE)
+    {
+        GLint infoLogLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLogLength);
+        std::vector<GLchar> infoLog(static_cast<size_t>(std::max(infoLogLength, 1)));
+        glGetProgramInfoLog(program, static_cast<GLsizei>(infoLog.size()), nullptr, infoLog.data());
+        FAIL() << "Program link failed: " << infoLog.data();
+    }
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, image);
+    glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32UI, 1, 1);
+    const std::array<GLuint, 6> initialValues = {3u, 5u, 7u, 9u, 11u, 13u};
+    for (GLuint face = 0; face < 6; ++face)
+    {
+        const GLenum faceTarget = GL_TEXTURE_CUBE_MAP_POSITIVE_X + face;
+        glTexSubImage2D(faceTarget, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                        &initialValues[face]);
+    }
+    glBindImageTexture(0, image, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
+
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 6);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    std::array<GLuint, 6> resultValues = {};
+    for (GLuint face = 0; face < 6; ++face)
+    {
+        const GLenum faceTarget = GL_TEXTURE_CUBE_MAP_POSITIVE_X + face;
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, faceTarget, image, 0);
+        ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+        glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &resultValues[face]);
+    }
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 6>{4u, 6u, 8u, 10u, 12u, 14u}), resultValues);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ImageSignedAndFloatLoadStore)
+{
+    constexpr char kWriteCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32i, binding = 0) writeonly uniform highp iimage2D signedImage;
+layout(r32f, binding = 1) writeonly uniform highp image2D floatImage;
+void main()
+{
+    imageStore(signedImage, ivec2(0), ivec4(-29));
+    imageStore(floatImage, ivec2(0), vec4(3.25));
+})";
+    constexpr char kReadCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(r32i, binding = 0) readonly uniform highp iimage2D signedImage;
+layout(r32f, binding = 1) readonly uniform highp image2D floatImage;
+layout(std430, binding = 0) buffer Output
+{
+    int signedValue;
+    float floatValue;
+} outputData;
+void main()
+{
+    outputData.signedValue = imageLoad(signedImage, ivec2(0)).r;
+    outputData.floatValue = imageLoad(floatImage, ivec2(0)).r;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(writeProgram, kWriteCS);
+    ANGLE_GL_COMPUTE_PROGRAM(readProgram, kReadCS);
+
+    GLTexture signedImage;
+    glBindTexture(GL_TEXTURE_2D, signedImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32I, 1, 1);
+    GLTexture floatImage;
+    glBindTexture(GL_TEXTURE_2D, floatImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 1, 1);
+    glBindImageTexture(0, signedImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32I);
+    glBindImageTexture(1, floatImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+
+    glUseProgram(writeProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLint) + sizeof(GLfloat), nullptr,
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, signedImage, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32I);
+    glBindImageTexture(1, floatImage, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glUseProgram(readProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    struct OutputValues
+    {
+        GLint signedValue;
+        GLfloat floatValue;
+    };
+    const auto *outputValues = static_cast<const OutputValues *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(OutputValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, outputValues);
+    EXPECT_EQ(-29, outputValues->signedValue);
+    EXPECT_FLOAT_EQ(3.25f, outputValues->floatValue);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ImageRgbaFormatLoadStore)
+{
+    constexpr char kWriteCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(rgba32i, binding = 0) writeonly uniform highp iimage2D signedImage;
+layout(rgba32ui, binding = 1) writeonly uniform highp uimage2D unsignedImage;
+layout(rgba32f, binding = 2) writeonly uniform highp image2D floatImage;
+void main()
+{
+    imageStore(signedImage, ivec2(0), ivec4(-1, -2, -3, -4));
+    imageStore(unsignedImage, ivec2(0), uvec4(11u, 12u, 13u, 14u));
+    imageStore(floatImage, ivec2(0), vec4(1.25, 2.5, -3.75, 4.5));
+})";
+    constexpr char kReadCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(rgba32i, binding = 0) readonly uniform highp iimage2D signedImage;
+layout(rgba32ui, binding = 1) readonly uniform highp uimage2D unsignedImage;
+layout(rgba32f, binding = 2) readonly uniform highp image2D floatImage;
+layout(std430, binding = 0) buffer Output
+{
+    ivec4 signedValues;
+    uvec4 unsignedValues;
+    vec4 floatValues;
+} outputData;
+void main()
+{
+    outputData.signedValues = imageLoad(signedImage, ivec2(0));
+    outputData.unsignedValues = imageLoad(unsignedImage, ivec2(0));
+    outputData.floatValues = imageLoad(floatImage, ivec2(0));
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(writeProgram, kWriteCS);
+    ANGLE_GL_COMPUTE_PROGRAM(readProgram, kReadCS);
+
+    GLTexture signedImage;
+    glBindTexture(GL_TEXTURE_2D, signedImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32I, 1, 1);
+    GLTexture unsignedImage;
+    glBindTexture(GL_TEXTURE_2D, unsignedImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32UI, 1, 1);
+    GLTexture floatImage;
+    glBindTexture(GL_TEXTURE_2D, floatImage);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, 1, 1);
+    glBindImageTexture(0, signedImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32I);
+    glBindImageTexture(1, unsignedImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
+    glBindImageTexture(2, floatImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+
+    glUseProgram(writeProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 3 * sizeof(GLint) * 4, nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, signedImage, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32I);
+    glBindImageTexture(1, unsignedImage, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32UI);
+    glBindImageTexture(2, floatImage, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glUseProgram(readProgram);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    struct OutputValues
+    {
+        GLint signedValues[4];
+        GLuint unsignedValues[4];
+        GLfloat floatValues[4];
+    };
+    const auto *outputValues = static_cast<const OutputValues *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(OutputValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, outputValues);
+    EXPECT_EQ(-1, outputValues->signedValues[0]);
+    EXPECT_EQ(-2, outputValues->signedValues[1]);
+    EXPECT_EQ(-3, outputValues->signedValues[2]);
+    EXPECT_EQ(-4, outputValues->signedValues[3]);
+    EXPECT_EQ(11u, outputValues->unsignedValues[0]);
+    EXPECT_EQ(12u, outputValues->unsignedValues[1]);
+    EXPECT_EQ(13u, outputValues->unsignedValues[2]);
+    EXPECT_EQ(14u, outputValues->unsignedValues[3]);
+    EXPECT_FLOAT_EQ(1.25f, outputValues->floatValues[0]);
+    EXPECT_FLOAT_EQ(2.5f, outputValues->floatValues[1]);
+    EXPECT_FLOAT_EQ(-3.75f, outputValues->floatValues[2]);
+    EXPECT_FLOAT_EQ(4.5f, outputValues->floatValues[3]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ImageRemainingCoreFormatsLoadStore)
+{
+    auto runFormat = [&](const char *formatQualifier, GLenum internalFormat, const char *imageType,
+                         const char *vectorType, const char *components, auto expected,
+                         auto expectValue) {
+        using ComponentType = typename decltype(expected)::value_type;
+        SCOPED_TRACE(formatQualifier);
+
+        std::string writeCS = "#version 310 es\nlayout(local_size_x = 1) in;\n";
+        writeCS += "layout(" + std::string(formatQualifier) +
+                   ", binding = 0) writeonly uniform highp " + imageType + " image;\n";
+        writeCS += std::string("void main() { imageStore(image, ivec2(0), ") + vectorType + "(" +
+                   components + ")); }\n";
+
+        std::string readCS = "#version 310 es\nlayout(local_size_x = 1) in;\n";
+        readCS += "layout(" + std::string(formatQualifier) +
+                  ", binding = 0) readonly uniform highp " + imageType + " image;\n";
+        readCS += "layout(std430, binding = 0) buffer Output { " + std::string(vectorType) +
+                  " values; } outputData;\n";
+        readCS += "void main() { outputData.values = imageLoad(image, ivec2(0)); }\n";
+
+        GLProgram writeProgram;
+        writeProgram.makeCompute(writeCS.c_str());
+        ASSERT_TRUE(writeProgram.valid());
+        GLProgram readProgram;
+        readProgram.makeCompute(readCS.c_str());
+        ASSERT_TRUE(readProgram.valid());
+
+        GLTexture image;
+        glBindTexture(GL_TEXTURE_2D, image);
+        glTexStorage2D(GL_TEXTURE_2D, 1, internalFormat, 1, 1);
+        glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_WRITE_ONLY, internalFormat);
+        GLBuffer outputBuffer;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), nullptr, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+
+        glUseProgram(writeProgram);
+        glDispatchCompute(1, 1, 1);
+        ASSERT_GL_NO_ERROR();
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_READ_ONLY, internalFormat);
+        glUseProgram(readProgram);
+        glDispatchCompute(1, 1, 1);
+        ASSERT_GL_NO_ERROR();
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+        const auto *values = static_cast<const ComponentType *>(glMapBufferRange(
+            GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
+        ASSERT_NE(nullptr, values);
+        for (size_t component = 0; component < expected.size(); ++component)
+        {
+            expectValue(expected[component], values[component]);
+        }
+        EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    };
+
+    runFormat("rgba16f", GL_RGBA16F, "image2D", "vec4", "1.5, -2.0, 0.5, 4.0",
+              std::array<GLfloat, 4>{1.5f, -2.0f, 0.5f, 4.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba8", GL_RGBA8, "image2D", "vec4", "0.0, 1.0, 2.0, -1.0",
+              std::array<GLfloat, 4>{0.0f, 1.0f, 1.0f, 0.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba8_snorm", GL_RGBA8_SNORM, "image2D", "vec4", "-1.0, 0.0, 0.0, 1.0",
+              std::array<GLfloat, 4>{-1.0f, 0.0f, 0.0f, 1.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba16i", GL_RGBA16I, "iimage2D", "ivec4", "-1, 0, 1, 32767",
+              std::array<GLint, 4>{-1, 0, 1, 32767},
+              [](GLint expected, GLint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba8i", GL_RGBA8I, "iimage2D", "ivec4", "-128, -1, 0, 127",
+              std::array<GLint, 4>{-128, -1, 0, 127},
+              [](GLint expected, GLint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba16ui", GL_RGBA16UI, "uimage2D", "uvec4", "0u, 1u, 32768u, 65535u",
+              std::array<GLuint, 4>{0u, 1u, 32768u, 65535u},
+              [](GLuint expected, GLuint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba8ui", GL_RGBA8UI, "uimage2D", "uvec4", "0u, 1u, 127u, 255u",
+              std::array<GLuint, 4>{0u, 1u, 127u, 255u},
+              [](GLuint expected, GLuint actual) { EXPECT_EQ(expected, actual); });
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, FragmentStageImageLoad)
+{
+    constexpr char kVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+void main()
+{
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kFS[] = R"(#version 310 es
+precision highp float;
+layout(r32ui, binding = 0) readonly uniform highp uimage2D sourceImage;
+layout(location = 0) out vec4 fragColor;
+void main()
+{
+    fragColor = vec4(float(imageLoad(sourceImage, ivec2(0)).r), 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(program, kVS, kFS);
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D, image);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
+    const GLuint initialValue = 1;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                    &initialValue);
+    glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
+    ASSERT_GL_NO_ERROR();
+
+    drawQuad(program, "position", 0.0f, 1.0f);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, GLColor::red);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, FragmentStageImageStore)
+{
+    constexpr char kVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+void main()
+{
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kFS[] = R"(#version 310 es
+precision highp float;
+layout(r32ui, binding = 0) writeonly uniform highp uimage2D destinationImage;
+layout(location = 0) out vec4 fragColor;
+void main()
+{
+    imageStore(destinationImage, ivec2(gl_FragCoord.xy), uvec4(37u));
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(program, kVS, kFS);
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D, image);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, getWindowWidth(), getWindowHeight());
+    glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    ASSERT_GL_NO_ERROR();
+
+    drawQuad(program, "position", 0.0f, 1.0f);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    GLuint value = 0;
+    glReadPixels(getWindowWidth() / 2, getWindowHeight() / 2, 1, 1, GL_RED_INTEGER,
+                 GL_UNSIGNED_INT, &value);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ(37u, value);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, VertexStageImageStore)
+{
+    constexpr char kVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+layout(r32ui, binding = 0) writeonly uniform highp uimage2D destinationImage;
+void main()
+{
+    imageStore(destinationImage, ivec2(gl_VertexID, 0), uvec4(uint(gl_VertexID) + 10u));
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kFS[] = R"(#version 310 es
+precision highp float;
+layout(location = 0) out vec4 fragColor;
+void main()
+{
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(program, kVS, kFS);
+
+    GLTexture image;
+    glBindTexture(GL_TEXTURE_2D, image);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 3, 1);
+    glBindImageTexture(0, image, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+
+    constexpr std::array<GLfloat, 6> positions = {-0.5f, 0.0f, 0.0f, 0.0f, 0.5f, 0.0f};
+    GLBuffer vertexBuffer;
+    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(positions), positions.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glEnableVertexAttribArray(0);
+
+    glUseProgram(program);
+    glDrawArrays(GL_POINTS, 0, 3);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    std::array<GLuint, 3> values = {};
+    glReadPixels(0, 0, 3, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, values.data());
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 3>{10u, 11u, 12u}), values);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsStageLayeredImageStores)
+{
+    constexpr char kLayeredVS[] = R"(#version 310 es
+layout(r32ui, binding = 0) writeonly uniform highp uimage2DArray arrayImage;
+layout(r32ui, binding = 1) writeonly uniform highp uimage3D volumeImage;
+layout(r32ui, binding = 2) writeonly uniform highp uimageCube cubeImage;
+void main()
+{
+    imageStore(arrayImage, ivec3(0, 0, 0), uvec4(11u));
+    imageStore(volumeImage, ivec3(0, 0, 0), uvec4(21u));
+    imageStore(cubeImage, ivec3(0, 0, 0), uvec4(31u));
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kLayeredFS[] = R"(#version 310 es
+precision highp float;
+layout(r32ui, binding = 0) writeonly uniform highp uimage2DArray arrayImage;
+layout(r32ui, binding = 1) writeonly uniform highp uimage3D volumeImage;
+layout(r32ui, binding = 2) writeonly uniform highp uimageCube cubeImage;
+out vec4 color;
+void main()
+{
+    imageStore(arrayImage, ivec3(0, 0, 1), uvec4(12u));
+    imageStore(volumeImage, ivec3(0, 0, 1), uvec4(22u));
+    imageStore(cubeImage, ivec3(0, 0, 4), uvec4(32u));
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    constexpr char kPlainVS[]   = R"(#version 310 es
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kPlainFS[]   = R"(#version 310 es
+precision highp float;
+out vec4 color;
+void main()
+{
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(vertexProgram, kLayeredVS, kPlainFS);
+    ANGLE_GL_PROGRAM(fragmentProgram, kPlainVS, kLayeredFS);
+
+    GLTexture arrayImage;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, arrayImage);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R32UI, 1, 1, 2);
+    GLTexture volumeImage;
+    glBindTexture(GL_TEXTURE_3D, volumeImage);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 2);
+    GLTexture cubeImage;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubeImage);
+    glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32UI, 1, 1);
+    ASSERT_GL_NO_ERROR();
+
+    glBindImageTexture(0, arrayImage, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glBindImageTexture(1, volumeImage, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glBindImageTexture(2, cubeImage, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
+    GLTexture framebufferTexture;
+    glBindTexture(GL_TEXTURE_2D, framebufferTexture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, framebufferTexture,
+                           0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
+    glViewport(0, 0, 1, 1);
+
+    glUseProgram(vertexProgram);
+    glDrawArrays(GL_POINTS, 0, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+    glUseProgram(fragmentProgram);
+    glDrawArrays(GL_POINTS, 0, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    std::array<GLuint, 6> values = {};
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, arrayImage, 0, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[0]);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, arrayImage, 0, 1);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[1]);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, volumeImage, 0, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[2]);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, volumeImage, 0, 1);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[3]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_CUBE_MAP_POSITIVE_X, cubeImage, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[4]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_CUBE_MAP_POSITIVE_X + 4, cubeImage, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[5]);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 6>{11u, 12u, 21u, 22u, 31u, 32u}), values);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsStageNonLayered3DImage2DStores)
+{
+    constexpr char kImageVS[] = R"(#version 310 es
+layout(r32ui, binding = 0) writeonly uniform highp uimage2D image;
+void main()
+{
+    imageStore(image, ivec2(0), uvec4(41u));
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kImageFS[] = R"(#version 310 es
+precision highp float;
+layout(r32ui, binding = 0) writeonly uniform highp uimage2D image;
+out vec4 color;
+void main()
+{
+    imageStore(image, ivec2(0), uvec4(42u));
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    constexpr char kPlainVS[] = R"(#version 310 es
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+})";
+    constexpr char kPlainFS[] = R"(#version 310 es
+precision highp float;
+out vec4 color;
+void main()
+{
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(vertexProgram, kImageVS, kPlainFS);
+    ANGLE_GL_PROGRAM(fragmentProgram, kPlainVS, kImageFS);
+
+    GLTexture image3D;
+    glBindTexture(GL_TEXTURE_3D, image3D);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 1, 1, 2);
+    ASSERT_GL_NO_ERROR();
+
+    GLTexture framebufferTexture;
+    glBindTexture(GL_TEXTURE_2D, framebufferTexture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, framebufferTexture,
+                           0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
+    glViewport(0, 0, 1, 1);
+
+    glBindImageTexture(0, image3D, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    glUseProgram(vertexProgram);
+    glDrawArrays(GL_POINTS, 0, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    glBindImageTexture(0, image3D, 0, GL_FALSE, 1, GL_WRITE_ONLY, GL_R32UI);
+    glUseProgram(fragmentProgram);
+    glDrawArrays(GL_POINTS, 0, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+    std::array<GLuint, 2> values = {};
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, image3D, 0, 0);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[0]);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, image3D, 0, 1);
+    ASSERT_GL_FRAMEBUFFER_COMPLETE(GL_READ_FRAMEBUFFER);
+    glReadPixels(0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &values[1]);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_EQ((std::array<GLuint, 2>{41u, 42u}), values);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsStageImageFormatsLoadStore)
+{
+    auto runFormat = [&](const char *formatQualifier, GLenum internalFormat, const char *imageType,
+                         const char *vectorType, const char *components, auto expected,
+                         auto expectValue) {
+        using ComponentType = typename decltype(expected)::value_type;
+        SCOPED_TRACE(formatQualifier);
+
+        const std::string declaration = "layout(" + std::string(formatQualifier) + ", binding = ";
+        std::string initializeCS      = R"(#version 310 es
+layout(local_size_x = 1) in;
+)";
+        initializeCS += declaration + "0) writeonly uniform highp " + imageType + " image;\n";
+        initializeCS += std::string("void main() { imageStore(image, ivec2(0), ") + vectorType +
+                        "(" + components + ")); }\n";
+
+        std::string readCS = R"(#version 310 es
+layout(local_size_x = 1) in;
+)";
+        readCS += declaration + "0) readonly uniform highp " + imageType + " image;\n";
+        readCS += "layout(std430, binding = 0) buffer Output { " + std::string(vectorType) +
+                  " value; } outputData;\n";
+        readCS += "void main() { outputData.value = imageLoad(image, ivec2(0)); }\n";
+
+        GLProgram initializeProgram;
+        initializeProgram.makeCompute(initializeCS.c_str());
+        ASSERT_TRUE(initializeProgram.valid());
+        GLProgram readProgram;
+        readProgram.makeCompute(readCS.c_str());
+        ASSERT_TRUE(readProgram.valid());
+
+        const std::string sourceDeclaration =
+            declaration + "0) readonly uniform highp " + imageType + " sourceImage;\n";
+        const std::string destinationDeclaration =
+            declaration + "1) writeonly uniform highp " + imageType + " destinationImage;\n";
+        const std::string copyImage =
+            "imageStore(destinationImage, ivec2(0), imageLoad(sourceImage, ivec2(0)));\n";
+        const std::string vertexShader = std::string("#version 310 es\n") + sourceDeclaration +
+                                         destinationDeclaration + "void main() { " + copyImage +
+                                         "gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+        constexpr char kFragmentOnlyVertexShader[]  = R"(#version 310 es
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+        constexpr char kVertexStageFragmentShader[] = R"(#version 310 es
+precision highp float;
+out vec4 fragColor;
+void main()
+{
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+        const std::string fragmentShader =
+            std::string("#version 310 es\nprecision highp float;\n") + sourceDeclaration +
+            destinationDeclaration + "out vec4 fragColor;\nvoid main() { " + copyImage +
+            "fragColor = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+        GLProgram vertexProgram;
+        vertexProgram.makeRaster(vertexShader.c_str(), kVertexStageFragmentShader);
+        ASSERT_TRUE(vertexProgram.valid());
+        GLProgram fragmentProgram;
+        fragmentProgram.makeRaster(kFragmentOnlyVertexShader, fragmentShader.c_str());
+        ASSERT_TRUE(fragmentProgram.valid());
+
+        GLTexture sourceImage;
+        glBindTexture(GL_TEXTURE_2D, sourceImage);
+        glTexStorage2D(GL_TEXTURE_2D, 1, internalFormat, 1, 1);
+        GLTexture destinationImage;
+        glBindTexture(GL_TEXTURE_2D, destinationImage);
+        glTexStorage2D(GL_TEXTURE_2D, 1, internalFormat, 1, 1);
+        glBindImageTexture(0, sourceImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, internalFormat);
+        glUseProgram(initializeProgram);
+        glDispatchCompute(1, 1, 1);
+        ASSERT_GL_NO_ERROR();
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+        GLBuffer outputBuffer;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), nullptr, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+
+        const std::array<GLProgram *, 2> graphicsPrograms = {&vertexProgram, &fragmentProgram};
+        for (size_t stage = 0; stage < graphicsPrograms.size(); ++stage)
+        {
+            glBindImageTexture(0, sourceImage, 0, GL_FALSE, 0, GL_READ_ONLY, internalFormat);
+            glBindImageTexture(1, destinationImage, 0, GL_FALSE, 0, GL_WRITE_ONLY, internalFormat);
+            glUseProgram(*graphicsPrograms[stage]);
+            glDrawArrays(GL_POINTS, 0, 1);
+            ASSERT_GL_NO_ERROR();
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
+            glBindImageTexture(0, destinationImage, 0, GL_FALSE, 0, GL_READ_ONLY, internalFormat);
+            glUseProgram(readProgram);
+            glDispatchCompute(1, 1, 1);
+            ASSERT_GL_NO_ERROR();
+            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+            const auto *values = static_cast<const ComponentType *>(glMapBufferRange(
+                GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
+            ASSERT_NE(nullptr, values);
+            for (size_t component = 0; component < expected.size(); ++component)
+            {
+                SCOPED_TRACE(stage == 0 ? "vertex stage" : "fragment stage");
+                expectValue(expected[component], values[component]);
+            }
+            EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+        }
+        EXPECT_GL_NO_ERROR();
+    };
+
+    runFormat("r32f", GL_R32F, "image2D", "vec4", "3.25, 0.0, 0.0, 1.0",
+              std::array<GLfloat, 4>{3.25f, 0.0f, 0.0f, 1.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("r32i", GL_R32I, "iimage2D", "ivec4", "-29, 0, 0, 1",
+              std::array<GLint, 4>{-29, 0, 0, 1},
+              [](GLint expected, GLint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("r32ui", GL_R32UI, "uimage2D", "uvec4", "17u, 0u, 0u, 1u",
+              std::array<GLuint, 4>{17u, 0u, 0u, 1u},
+              [](GLuint expected, GLuint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba32f", GL_RGBA32F, "image2D", "vec4", "1.25, 2.5, -3.75, 4.5",
+              std::array<GLfloat, 4>{1.25f, 2.5f, -3.75f, 4.5f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba32i", GL_RGBA32I, "iimage2D", "ivec4", "-1, -2, -3, -4",
+              std::array<GLint, 4>{-1, -2, -3, -4},
+              [](GLint expected, GLint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba32ui", GL_RGBA32UI, "uimage2D", "uvec4", "11u, 12u, 13u, 14u",
+              std::array<GLuint, 4>{11u, 12u, 13u, 14u},
+              [](GLuint expected, GLuint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba16f", GL_RGBA16F, "image2D", "vec4", "1.5, -2.0, 0.5, 4.0",
+              std::array<GLfloat, 4>{1.5f, -2.0f, 0.5f, 4.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba8", GL_RGBA8, "image2D", "vec4", "0.0, 1.0, 0.0, 1.0",
+              std::array<GLfloat, 4>{0.0f, 1.0f, 0.0f, 1.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba8_snorm", GL_RGBA8_SNORM, "image2D", "vec4", "-1.0, 0.0, 0.0, 1.0",
+              std::array<GLfloat, 4>{-1.0f, 0.0f, 0.0f, 1.0f},
+              [](GLfloat expected, GLfloat actual) { EXPECT_FLOAT_EQ(expected, actual); });
+    runFormat("rgba16i", GL_RGBA16I, "iimage2D", "ivec4", "-1, 0, 1, 32767",
+              std::array<GLint, 4>{-1, 0, 1, 32767},
+              [](GLint expected, GLint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba8i", GL_RGBA8I, "iimage2D", "ivec4", "-128, -1, 0, 127",
+              std::array<GLint, 4>{-128, -1, 0, 127},
+              [](GLint expected, GLint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba16ui", GL_RGBA16UI, "uimage2D", "uvec4", "0u, 1u, 32768u, 65535u",
+              std::array<GLuint, 4>{0u, 1u, 32768u, 65535u},
+              [](GLuint expected, GLuint actual) { EXPECT_EQ(expected, actual); });
+    runFormat("rgba8ui", GL_RGBA8UI, "uimage2D", "uvec4", "0u, 1u, 127u, 255u",
+              std::array<GLuint, 4>{0u, 1u, 127u, 255u},
+              [](GLuint expected, GLuint actual) { EXPECT_EQ(expected, actual); });
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsStageStorageBufferAccess)
+{
+    constexpr char kVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+layout(std430, binding = 0) readonly buffer VertexData
+{
+    float value;
+} vertexData;
+layout(std430, binding = 2) writeonly buffer VertexOutput
+{
+    float values[];
+} vertexOutput;
+out float vertexValue;
+void main()
+{
+    vertexValue = vertexData.value;
+    vertexOutput.values[gl_VertexID] = vertexData.value;
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kFS[] = R"(#version 310 es
+precision highp float;
+layout(std430, binding = 1) readonly buffer FragmentData
+{
+    vec3 color;
+} fragmentData;
+in float vertexValue;
+layout(location = 0) out vec4 fragColor;
+void main()
+{
+    fragColor = vec4(fragmentData.color.r, vertexValue, fragmentData.color.b, 1.0);
+})";
+
+    ANGLE_GL_PROGRAM(program, kVS, kFS);
+
+    const GLfloat vertexValue = 0.0f;
+    const std::array<GLfloat, 3> fragmentColor = {1.0f, 0.0f, 1.0f};
+    GLBuffer vertexBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, vertexBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(vertexValue), &vertexValue, GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, vertexBuffer);
+
+    GLBuffer fragmentBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fragmentBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(fragmentColor), fragmentColor.data(),
+                 GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, fragmentBuffer);
+
+    std::array<GLfloat, 6> outputValues = {};
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(outputValues), outputValues.data(),
+                 GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, outputBuffer);
+
+    drawQuad(program, "position", 0.0f, 1.0f);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, GLColor::magenta);
+
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    const auto *writtenValues = static_cast<const GLfloat *>(glMapBufferRange(
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(outputValues), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, writtenValues);
+    for (size_t i = 0; i < outputValues.size(); ++i)
+    {
+        EXPECT_EQ(0.0f, writtenValues[i]);
+    }
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, ShaderStorageBufferBlockArray)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer Data
+{
+    uint lengthResult;
+    uint values[];
+} data[2];
+void main()
+{
+    uint firstLength = uint(data[0].values.length());
+    uint secondLength = uint(data[1].values.length());
+    data[0].lengthResult = firstLength;
+    data[1].lengthResult = secondLength;
+    data[0].values[0] = firstLength * 100u;
+    data[1].values[0] = secondLength * 100u;
+})";
+    ANGLE_GL_COMPUTE_PROGRAM(program, kCS);
+
+    std::array<GLuint, 4> firstData = {0, 10, 20, 30};
+    GLBuffer firstBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, firstBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(firstData), firstData.data(), GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, firstBuffer);
+
+    std::array<GLuint, 3> secondData = {0, 40, 50};
+    GLBuffer secondBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, secondBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(secondData), secondData.data(), GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, secondBuffer);
+
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    ASSERT_GL_NO_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, firstBuffer);
+    const auto *firstResult = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(firstData), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, firstResult);
+    EXPECT_EQ(3u, firstResult[0]);
+    EXPECT_EQ(300u, firstResult[1]);
+    EXPECT_EQ(20u, firstResult[2]);
+    EXPECT_EQ(30u, firstResult[3]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, secondBuffer);
+    const auto *secondResult = static_cast<const GLuint *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(secondData), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, secondResult);
+    EXPECT_EQ(2u, secondResult[0]);
+    EXPECT_EQ(200u, secondResult[1]);
+    EXPECT_EQ(50u, secondResult[2]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, GraphicsStageShaderStorageBufferBlockArrays)
+{
+    constexpr char kVertexArrayVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+layout(std430, binding = 0) readonly buffer VertexData
+{
+    float value;
+} vertexData[2];
+out float vertexValue;
+void main()
+{
+    vertexValue = vertexData[0].value + vertexData[1].value;
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kVertexArrayFS[] = R"(#version 310 es
+precision highp float;
+in float vertexValue;
+layout(location = 0) out vec4 fragColor;
+void main()
+{
+    fragColor = vec4(vertexValue, 0.0, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(vertexArrayProgram, kVertexArrayVS, kVertexArrayFS);
+
+    const GLfloat vertexValues[2] = {0.25f, 0.75f};
+    GLBuffer vertexBuffer0;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, vertexBuffer0);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLfloat), &vertexValues[0], GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, vertexBuffer0);
+    GLBuffer vertexBuffer1;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, vertexBuffer1);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLfloat), &vertexValues[1], GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, vertexBuffer1);
+
+    drawQuad(vertexArrayProgram, "position", 0.0f, 1.0f);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, GLColor::red);
+
+    constexpr char kFragmentArrayVS[] = R"(#version 310 es
+layout(location = 0) in vec2 position;
+void main()
+{
+    gl_Position = vec4(position, 0.0, 1.0);
+})";
+    constexpr char kFragmentArrayFS[] = R"(#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer FragmentData
+{
+    vec3 color;
+} fragmentData[2];
+layout(location = 0) out vec4 fragColor;
+void main()
+{
+    fragColor = vec4(fragmentData[0].color.r, fragmentData[1].color.g, 0.0, 1.0);
+})";
+    ANGLE_GL_PROGRAM(fragmentArrayProgram, kFragmentArrayVS, kFragmentArrayFS);
+
+    const std::array<GLfloat, 3> fragmentColor0 = {1.0f, 0.0f, 0.0f};
+    const std::array<GLfloat, 3> fragmentColor1 = {0.0f, 1.0f, 0.0f};
+    GLBuffer fragmentBuffer0;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fragmentBuffer0);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(fragmentColor0), fragmentColor0.data(),
+                 GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, fragmentBuffer0);
+    GLBuffer fragmentBuffer1;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fragmentBuffer1);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(fragmentColor1), fragmentColor1.data(),
+                 GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, fragmentBuffer1);
+
+    drawQuad(fragmentArrayProgram, "position", 0.0f, 1.0f);
+    EXPECT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, GLColor::yellow);
+}
 
 // link a simple compute program. It should be successful.
 TEST_P(ComputeShaderTest, LinkComputeProgram)
@@ -5823,6 +8686,149 @@ void main() {
     EXPECT_GL_NO_ERROR();
 }
 
+TEST_P(ExperimentalGles31MetalComputeTest, TextureBufferSamplerAndImageFormatReinterpretation)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_texture_buffer"));
+
+    constexpr char kComputeShader[] = R"(#version 310 es
+#extension GL_EXT_texture_buffer : require
+layout(local_size_x = 1) in;
+layout(rgba8ui, binding = 0) writeonly uniform highp uimageBuffer image;
+void main()
+{
+    if (imageSize(image) >= 4)
+    {
+        imageStore(image, 3, uvec4(255u, 0u, 0u, 255u));
+    }
+})";
+    constexpr char kFragmentShader[] = R"(#version 310 es
+#extension GL_EXT_texture_buffer : require
+precision highp float;
+uniform highp samplerBuffer source;
+out vec4 colorOut;
+void main()
+{
+    colorOut = texelFetch(source, 3);
+})";
+
+    const std::array<GLubyte, 16> initialData = {0,   255, 0,   255, 0, 0, 255, 255,
+                                                  255, 0,   0,   255, 0, 255, 0,   255};
+    GLBuffer buffer;
+    glBindBuffer(GL_TEXTURE_BUFFER, buffer);
+    glBufferData(GL_TEXTURE_BUFFER, initialData.size(), initialData.data(), GL_DYNAMIC_DRAW);
+
+    GLTexture texture;
+    glBindTexture(GL_TEXTURE_BUFFER, texture);
+    glTexBufferEXT(GL_TEXTURE_BUFFER, GL_RGBA8, buffer);
+    ASSERT_GL_NO_ERROR();
+
+    ANGLE_GL_COMPUTE_PROGRAM(computeProgram, kComputeShader);
+    glUseProgram(computeProgram);
+    glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+    ASSERT_GL_NO_ERROR();
+
+    ANGLE_GL_PROGRAM(program, essl31_shaders::vs::Simple(), kFragmentShader);
+    glUseProgram(program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_BUFFER, texture);
+    glUniform1i(glGetUniformLocation(program, "source"), 0);
+    drawQuad(program, essl31_shaders::PositionAttrib(), 0.5);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::red);
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, TextureBufferImageAtomicAdd)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_texture_buffer"));
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kComputeShader[] = R"(#version 310 es
+#extension GL_EXT_texture_buffer : require
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32ui, binding = 0) uniform highp uimageBuffer image;
+void main()
+{
+    imageAtomicAdd(image, 0, 3u);
+})";
+
+    const GLuint initialValue = 4;
+    GLBuffer buffer;
+    glBindBuffer(GL_TEXTURE_BUFFER, buffer);
+    glBufferData(GL_TEXTURE_BUFFER, sizeof(initialValue), &initialValue, GL_DYNAMIC_DRAW);
+
+    GLTexture texture;
+    glBindTexture(GL_TEXTURE_BUFFER, texture);
+    glTexBufferEXT(GL_TEXTURE_BUFFER, GL_R32UI, buffer);
+    ASSERT_GL_NO_ERROR();
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kComputeShader);
+    glUseProgram(program);
+    glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    ASSERT_GL_NO_ERROR();
+
+    const auto *result = static_cast<const GLuint *>(
+        glMapBufferRange(GL_TEXTURE_BUFFER, 0, sizeof(initialValue), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, result);
+    EXPECT_EQ(7u, *result);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_TEXTURE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
+TEST_P(ExperimentalGles31MetalComputeTest, TextureBufferR32fImageAtomicExchange)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_texture_buffer"));
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_OES_shader_image_atomic"));
+
+    constexpr char kComputeShader[] = R"(#version 310 es
+#extension GL_EXT_texture_buffer : require
+#extension GL_OES_shader_image_atomic : require
+layout(local_size_x = 1) in;
+layout(r32f, binding = 0) uniform highp imageBuffer floatImage;
+layout(std430, binding = 0) buffer Output
+{
+    vec2 values;
+} outputData;
+void main()
+{
+    outputData.values.x = imageAtomicExchange(floatImage, 0, 2.5);
+    outputData.values.y = imageLoad(floatImage, 0).r;
+})";
+
+    constexpr GLfloat initialValue = 1.25f;
+    GLBuffer textureBuffer;
+    glBindBuffer(GL_TEXTURE_BUFFER, textureBuffer);
+    glBufferData(GL_TEXTURE_BUFFER, sizeof(initialValue), &initialValue, GL_DYNAMIC_DRAW);
+
+    GLTexture floatImage;
+    glBindTexture(GL_TEXTURE_BUFFER, floatImage);
+    glTexBufferEXT(GL_TEXTURE_BUFFER, GL_R32F, textureBuffer);
+    ASSERT_GL_NO_ERROR();
+
+    ANGLE_GL_COMPUTE_PROGRAM(program, kComputeShader);
+    GLBuffer outputBuffer;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outputBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * sizeof(GLfloat), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outputBuffer);
+    glBindImageTexture(0, floatImage, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    glUseProgram(program);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    ASSERT_GL_NO_ERROR();
+
+    const auto *actual = static_cast<const GLfloat *>(
+        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 2 * sizeof(GLfloat), GL_MAP_READ_BIT));
+    ASSERT_NE(nullptr, actual);
+    EXPECT_FLOAT_EQ(initialValue, actual[0]);
+    EXPECT_FLOAT_EQ(2.5f, actual[1]);
+    EXPECT_GL_TRUE(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER));
+    EXPECT_GL_NO_ERROR();
+}
+
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ComputeShaderTest);
 ANGLE_INSTANTIATE_TEST_ES31_AND(ComputeShaderTest,
                                 ES31_VULKAN().enable(Feature::ForceRobustResourceInit),
@@ -5830,6 +8836,8 @@ ANGLE_INSTANTIATE_TEST_ES31_AND(ComputeShaderTest,
 
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ComputeShaderTestES3);
 ANGLE_INSTANTIATE_TEST_ES3(ComputeShaderTestES3);
+
+ANGLE_INSTANTIATE_TEST(ExperimentalGles31MetalComputeTest, ExperimentalGles31Metal());
 
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(StorageImageRenderProgramTest);
 ANGLE_INSTANTIATE_TEST_ES31(StorageImageRenderProgramTest);

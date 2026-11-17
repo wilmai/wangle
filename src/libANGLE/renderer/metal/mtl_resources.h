@@ -218,6 +218,14 @@ class Texture final : public Resource,
                                        bool renderTargetOnly,
                                        bool allowFormatView,
                                        TextureRef *refOut);
+    static angle::Result MakeBufferTexture(ContextMtl *context,
+                                           MTLPixelFormat pixelFormat,
+                                           const BufferRef &buffer,
+                                           size_t offset,
+                                           uint32_t width,
+                                           size_t bytesPerRow,
+                                           MTLTextureUsage usage,
+                                           TextureRef *refOut);
     static TextureRef MakeFromMetal(id<MTLTexture> metalTexture);
 
     // Allow CPU to read & write data directly to this texture?
@@ -257,16 +265,26 @@ class Texture final : public Resource,
     TextureRef createCubeFaceView(uint32_t face);
     // Create a view of one slice at a level.
     TextureRef createSliceMipView(uint32_t slice, const MipmapNativeLevel &level);
+    TextureRef createSliceMipView(uint32_t slice,
+                                  const MipmapNativeLevel &level,
+                                  MTLPixelFormat format);
     // Create a levels range view
     TextureRef createMipsView(const MipmapNativeLevel &baseLevel, uint32_t levels);
+    TextureRef createMipsView(const MipmapNativeLevel &baseLevel,
+                              uint32_t levels,
+                              MTLPixelFormat format);
     // Create a view of a level.
     TextureRef createMipView(const MipmapNativeLevel &level);
+    TextureRef createMipView(const MipmapNativeLevel &level, MTLPixelFormat format);
     // Create a view with different format
     TextureRef createViewWithDifferentFormat(MTLPixelFormat format);
     // Create a view for a shader image binding.
     TextureRef createShaderImageView2D(const MipmapNativeLevel &level,
                                        int layer,
                                        MTLPixelFormat format);
+    TextureRef createShaderImageViewLayered(const MipmapNativeLevel &level,
+                                            MTLPixelFormat format,
+                                            bool cubeAs2DArray = false);
     // Same as above but the target format must be compatible, for example sRGB to linear. In
     // this case texture doesn't need format view usage flag.
     TextureRef createViewWithCompatibleFormat(MTLPixelFormat format);
@@ -376,6 +394,9 @@ class Texture final : public Resource,
                                      TextureRef *refOut);
 
     Texture(id<MTLTexture> metalTexture);
+
+    // Create a buffer-backed texture that shares the source buffer's resource tracking.
+    Texture(Resource *original, id<MTLTexture> metalTexture);
 
     // Create a texture that shares ownership of usageRef, underlying MTLTexture and colorWriteMask
     // with the original texture.

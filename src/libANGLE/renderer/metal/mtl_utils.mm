@@ -942,8 +942,28 @@ angle::ObjCPtr<id<MTLLibrary>> CreateShaderLibrary(
 #pragma clang diagnostic pop
         }
 
-        options.get().languageVersion =
-            GetUserSetOrHighestMSLVersion(options.get().languageVersion);
+        MTLLanguageVersion currentLanguageVersion = options.get().languageVersion;
+        if (source.find("ANGLE_REQUIRES_MSL_3_2") != std::string_view::npos)
+        {
+            if (@available(macOS 15.0, iOS 18.0, *))
+            {
+                if (currentLanguageVersion < MTLLanguageVersion3_2)
+                {
+                    currentLanguageVersion = MTLLanguageVersion3_2;
+                }
+            }
+        }
+        else if (source.find("ANGLE_REQUIRES_MSL_3_1") != std::string_view::npos)
+        {
+            if (@available(macOS 14.0, iOS 17.0, *))
+            {
+                if (currentLanguageVersion < MTLLanguageVersion3_1)
+                {
+                    currentLanguageVersion = MTLLanguageVersion3_1;
+                }
+            }
+        }
+        options.get().languageVersion = GetUserSetOrHighestMSLVersion(currentLanguageVersion);
 
         if (!substitutionMacros.empty())
         {

@@ -246,7 +246,7 @@ static inline int4 readR10G10B10A2_SINT(COMMON_READ_FUNC_PARAMS)
     color.rgb          = (isRgbNegative * negativeMask) | color.rgb;
 
     color.a             = getShiftedData<2, 30>(src);
-    int isAlphaNegative = color.a & alphaSignMask >> 1;
+    int isAlphaNegative = (color.a & alphaSignMask) >> 1;
     color.a             = (isAlphaNegative * alphaNegMask) | color.a;
     return color;
 }

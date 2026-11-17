@@ -39,7 +39,7 @@ class RenderTargetMtl;
 class WindowSurfaceMtl;
 class TransformFeedbackMtl;
 
-class ContextMtl : public ContextImpl, public mtl::Context
+class ContextMtl : public ContextImpl, public mtl::Context, public MultisampleTextureInitializer
 {
   public:
     ContextMtl(const gl::State &state,
@@ -61,6 +61,16 @@ class ContextMtl : public ContextImpl, public mtl::Context
 
     void registerBufferPool(mtl::BufferPool *pool);
     void unregisterBufferPool(mtl::BufferPool *pool);
+
+    bool isXfbReplayEnabled() const { return mXfbReplayEnabled; }
+    bool isXfbReplayPass() const { return mXfbReplayPass; }
+    void setXfbReplayEnabled(bool enabled) { mXfbReplayEnabled = enabled; }
+    void setXfbReplayPass(bool replayPass) { mXfbReplayPass = replayPass; }
+    void resetXfbReplayState()
+    {
+        mXfbReplayEnabled = false;
+        mXfbReplayPass    = false;
+    }
 
     // Drawing methods.
     angle::Result drawArrays(const gl::Context *context,
@@ -341,6 +351,9 @@ class ContextMtl : public ContextImpl, public mtl::Context
                                        gl::SamplerFormat format,
                                        gl::Texture **textureOut);
 
+    angle::Result initializeMultisampleTextureToBlack(const gl::Context *context,
+                                                      gl::Texture *glTexture) override;
+
     // Ends any active command encoder
     void endEncoding(bool forceSaveRenderPassContent);
 
@@ -575,7 +588,9 @@ class ContextMtl : public ContextImpl, public mtl::Context
         int32_t xfbBufferOffsets[4];
         int32_t xfbVerticesPerInstance;
         uint32_t coverageMask;  // Metal specific
-        uint32_t unused2[2];
+        int32_t xfbReplayVertexOffset;
+        uint32_t xfbReplayEnabled;
+        uint32_t imageLayers[mtl::kMaxShaderImages];
     };
     static_assert(sizeof(DriverUniforms) % (sizeof(uint32_t) * 4) == 0,
                   "DriverUniforms should be 16 bytes aligned");
@@ -635,6 +650,8 @@ class ContextMtl : public ContextImpl, public mtl::Context
     mtl::BufferPool mLineLoopIndexBuffer;
     mtl::BufferPool mLineLoopLastSegmentIndexBuffer;
     mtl::BufferPool mTriFanIndexBuffer;
+    mtl::BufferPool mXfbReplayBufferPool;
+    mtl::BufferSlice mXfbReplayBuffer;
     // one buffer can be reused for any starting vertex in DrawArrays()
     mtl::BufferRef mTriFanArraysIndexBuffer;
 
@@ -650,7 +667,9 @@ class ContextMtl : public ContextImpl, public mtl::Context
 
     mtl::ContextDevice mContextDevice;
 
-    bool mContextLost = false;
+    bool mContextLost      = false;
+    bool mXfbReplayEnabled = false;
+    bool mXfbReplayPass    = false;
 
     mtl::BufferRef mOcclusionQueryResultBuffer;
     bool mOcclusionQueryIsEnabledInRenderPass{false};

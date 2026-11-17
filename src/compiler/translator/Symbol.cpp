@@ -130,7 +130,8 @@ TStructure::TStructure(TSymbolTable *symbolTable,
     : TSymbol(symbolTable, name, symbolType, SymbolClass::Struct),
       TFieldListCollection(fields),
       mAtGlobalScope(false),
-      mImplementingInterfaceBlock(false)
+      mImplementingInterfaceBlock(false),
+      mImplementingShaderStorageBlock(false)
 {}
 
 void TStructure::setName(const ImmutableString &name)

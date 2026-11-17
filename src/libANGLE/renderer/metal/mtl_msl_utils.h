@@ -10,6 +10,7 @@
 #define mtl_msl_utils_h
 
 #include <memory>
+#include <vector>
 
 #include "compiler/translator/msl/TranslatorMSL.h"
 #include "libANGLE/Context.h"
@@ -26,6 +27,10 @@ using SharedCompiledShaderStateMtl = std::shared_ptr<CompiledShaderStateMtl>;
 
 namespace mtl
 {
+constexpr uint32_t kAtomicCounterStorageBufferMappingBase =
+    gl::IMPLEMENTATION_MAX_SHADER_STORAGE_BUFFER_BINDINGS -
+    gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS;
+
 struct SamplerBinding
 {
     uint32_t textureBinding = 0;
@@ -40,10 +45,13 @@ struct TranslatedShaderInfo
     // Metal library compiled from source code above. Used by ProgramMtl.
     angle::ObjCPtr<id<MTLLibrary>> metalLibrary;
     std::array<SamplerBinding, kMaxGLSamplerBindings> actualSamplerBindings;
-    std::array<int, kMaxShaderImages> actualImageBindings;
+    std::array<std::vector<sh::RWTextureBinding>, kMaxShaderImages> actualImageBindings;
     std::array<uint32_t, kMaxGLUBOBindings> actualUBOBindings;
+    std::array<uint32_t, gl::IMPLEMENTATION_MAX_SHADER_STORAGE_BUFFER_BINDINGS>
+        actualStorageBufferBindings;
     std::array<uint32_t, kMaxShaderXFBs> actualXFBBindings;
     bool hasUBOArgumentBuffer;
+    bool hasSSBOArgumentBuffer;
     bool hasIsnanOrIsinf;
     bool hasInvariant;
 };

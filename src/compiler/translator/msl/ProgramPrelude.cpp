@@ -35,6 +35,7 @@ class ProgramPrelude : public TIntermTraverser
     ProgramPrelude(TInfoSinkBase &out, const ProgramPreludeConfig &ppc)
         : TIntermTraverser(true, false, false),
           mOut(out),
+          mShaderType(ppc.shaderType),
           mAllowSamplerCompareGradient(ppc.allowSamplerCompareGradient)
     {
         mOut << "#include <metal_stdlib>\n\n";
@@ -58,7 +59,6 @@ class ProgramPrelude : public TIntermTraverser
                 }
                 break;
             case MetalShaderType::Compute:
-                ASSERT(0 && "compute shaders not currently supported");
                 break;
             default:
                 break;
@@ -163,6 +163,14 @@ class ProgramPrelude : public TIntermTraverser
     void equalArray();
     void equalStructArray();
     void notEqualArray();
+    void bitCount();
+    void findLSB();
+    void findMSB();
+    void uaddCarry();
+    void usubBorrow();
+    void umulExtended();
+    void imulExtended();
+    void frexp();
     void signInt();
     void pack_half_2x16();
     void unpack_half_2x16();
@@ -175,6 +183,7 @@ class ProgramPrelude : public TIntermTraverser
     void castMatrix();
     void functionConstants();
     void textureEnv();
+    void texelFetch_buffer();
     void texelFetch_2D();
     void texelFetch_3D();
     void texelFetch_2DArray();
@@ -288,9 +297,16 @@ class ProgramPrelude : public TIntermTraverser
     void textureSize_2DArray();
     void textureSize_2DArrayShadow();
     void textureSize_2DMS();
+    void textureSize_buffer();
+    void imageSize();
     void imageLoad();
     void imageStore();
+    void imageAtomic();
     void memoryBarrierImage();
+    void computeBarrier();
+    void computeMemoryBarrier();
+    void graphicsMemoryBarrier();
+    void atomicCompSwap();
     void interpolateAtCenter();
     void interpolateAtCentroid();
     void interpolateAtSample();
@@ -299,6 +315,7 @@ class ProgramPrelude : public TIntermTraverser
 
   private:
     TInfoSinkBase &mOut;
+    const MetalShaderType mShaderType;
     const bool mAllowSamplerCompareGradient;
     std::unordered_set<LineTag> mEmitted;
     std::unordered_set<const TSymbol *> mHandled;
@@ -558,6 +575,410 @@ ANGLE_ALWAYS_INLINE Z ANGLE_imul(X x, Y y)
 }
 )")
 
+PROGRAM_PRELUDE_DECLARE(bitCount,
+                        R"(
+ANGLE_ALWAYS_INLINE int ANGLE_bitCount(int x)
+{
+    return int(metal::popcount(as_type<uint>(x)));
+}
+ANGLE_ALWAYS_INLINE int ANGLE_bitCount(uint x)
+{
+    return int(metal::popcount(x));
+}
+
+#define ANGLE_DEFINE_BIT_COUNT_VECTOR(N)                                                 \
+    ANGLE_ALWAYS_INLINE metal::int##N ANGLE_bitCount(metal::int##N x)                   \
+    {                                                                                    \
+        return metal::int##N(metal::popcount(as_type<metal::uint##N>(x)));               \
+    }                                                                                    \
+    ANGLE_ALWAYS_INLINE metal::int##N ANGLE_bitCount(metal::uint##N x)                  \
+    {                                                                                    \
+        return metal::int##N(metal::popcount(x));                                        \
+    }
+ANGLE_DEFINE_BIT_COUNT_VECTOR(2)
+ANGLE_DEFINE_BIT_COUNT_VECTOR(3)
+ANGLE_DEFINE_BIT_COUNT_VECTOR(4)
+#undef ANGLE_DEFINE_BIT_COUNT_VECTOR
+)")
+
+PROGRAM_PRELUDE_DECLARE(findLSB,
+                        R"(
+ANGLE_ALWAYS_INLINE int ANGLE_findLSB(int x)
+{
+    return x == 0 ? -1 : int(metal::ctz(as_type<uint>(x)));
+}
+ANGLE_ALWAYS_INLINE int ANGLE_findLSB(uint x)
+{
+    return x == 0 ? -1 : int(metal::ctz(x));
+}
+
+#define ANGLE_DEFINE_FIND_LSB_VECTOR(N)                                                  \
+    ANGLE_ALWAYS_INLINE metal::int##N ANGLE_findLSB(metal::int##N x)                    \
+    {                                                                                    \
+        metal::uint##N bits = as_type<metal::uint##N>(x);                                \
+        return metal::select(metal::int##N(-1), metal::int##N(metal::ctz(bits)),         \
+                             bits != metal::uint##N(0));                                 \
+    }                                                                                    \
+    ANGLE_ALWAYS_INLINE metal::int##N ANGLE_findLSB(metal::uint##N x)                   \
+    {                                                                                    \
+        return metal::select(metal::int##N(-1), metal::int##N(metal::ctz(x)),           \
+                             x != metal::uint##N(0));                                    \
+    }
+ANGLE_DEFINE_FIND_LSB_VECTOR(2)
+ANGLE_DEFINE_FIND_LSB_VECTOR(3)
+ANGLE_DEFINE_FIND_LSB_VECTOR(4)
+#undef ANGLE_DEFINE_FIND_LSB_VECTOR
+)")
+
+PROGRAM_PRELUDE_DECLARE(findMSB,
+                        R"(
+ANGLE_ALWAYS_INLINE int ANGLE_findMSB(uint x)
+{
+    return x == 0 ? -1 : 31 - int(metal::clz(x));
+}
+ANGLE_ALWAYS_INLINE int ANGLE_findMSB(int x)
+{
+    uint bits = as_type<uint>(x);
+    bits = x < 0 ? ~bits : bits;
+    return bits == 0 ? -1 : 31 - int(metal::clz(bits));
+}
+
+#define ANGLE_DEFINE_FIND_MSB_VECTOR(N)                                                  \
+    ANGLE_ALWAYS_INLINE metal::int##N ANGLE_findMSB(metal::uint##N x)                   \
+    {                                                                                    \
+        metal::int##N result = metal::int##N(31) - metal::int##N(metal::clz(x));         \
+        return metal::select(metal::int##N(-1), result, x != metal::uint##N(0));        \
+    }                                                                                    \
+    ANGLE_ALWAYS_INLINE metal::int##N ANGLE_findMSB(metal::int##N x)                    \
+    {                                                                                    \
+        metal::uint##N bits = as_type<metal::uint##N>(x);                                \
+        bits = metal::select(bits, ~bits, x < metal::int##N(0));                         \
+        metal::int##N result = metal::int##N(31) - metal::int##N(metal::clz(bits));      \
+        return metal::select(metal::int##N(-1), result, bits != metal::uint##N(0));     \
+    }
+ANGLE_DEFINE_FIND_MSB_VECTOR(2)
+ANGLE_DEFINE_FIND_MSB_VECTOR(3)
+ANGLE_DEFINE_FIND_MSB_VECTOR(4)
+#undef ANGLE_DEFINE_FIND_MSB_VECTOR
+)")
+
+PROGRAM_PRELUDE_DECLARE(uaddCarry,
+                        R"(
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_uaddCarryImpl(T x, T y, thread T &carry)
+{
+    T sum = x + y;
+    carry = metal::select(T(0), T(1), sum < x);
+    return sum;
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_uaddCarry(T x, T y, thread T &carry)
+{
+    return ANGLE_uaddCarryImpl(x, y, carry);
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_uaddCarry(T x, T y, device T &carry)
+{
+    T carryValue;
+    T sum = ANGLE_uaddCarryImpl(x, y, carryValue);
+    carry = carryValue;
+    return sum;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE T ANGLE_uaddCarry(T x, T y, ANGLE_VectorElemRef<T, N> carry)
+{
+    T carryValue;
+    T sum = ANGLE_uaddCarryImpl(x, y, carryValue);
+    carry.mRef = carryValue;
+    return sum;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE T ANGLE_uaddCarry(T x, T y, ANGLE_DeviceVectorElemRef<T, N> carry)
+{
+    T carryValue;
+    T sum = ANGLE_uaddCarryImpl(x, y, carryValue);
+    carry.mRef = carryValue;
+    return sum;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE metal::vec<T, SN> ANGLE_uaddCarry(metal::vec<T, SN> x,
+                                                     metal::vec<T, SN> y,
+                                                     ANGLE_SwizzleRef<T, VN, SN> carry)
+{
+    metal::vec<T, SN> carryValue;
+    metal::vec<T, SN> sum = ANGLE_uaddCarryImpl(x, y, carryValue);
+    carry.mRef = carryValue;
+    return sum;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE metal::vec<T, SN> ANGLE_uaddCarry(
+    metal::vec<T, SN> x,
+    metal::vec<T, SN> y,
+    ANGLE_DeviceSwizzleRef<T, VN, SN> carry)
+{
+    metal::vec<T, SN> carryValue;
+    metal::vec<T, SN> sum = ANGLE_uaddCarryImpl(x, y, carryValue);
+    carry.mRef = carryValue;
+    return sum;
+}
+)",
+                        swizzleRef())
+
+PROGRAM_PRELUDE_DECLARE(usubBorrow,
+                        R"(
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_usubBorrowImpl(T x, T y, thread T &borrow)
+{
+    T difference = x - y;
+    borrow = metal::select(T(0), T(1), x < y);
+    return difference;
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_usubBorrow(T x, T y, thread T &borrow)
+{
+    return ANGLE_usubBorrowImpl(x, y, borrow);
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_usubBorrow(T x, T y, device T &borrow)
+{
+    T borrowValue;
+    T difference = ANGLE_usubBorrowImpl(x, y, borrowValue);
+    borrow = borrowValue;
+    return difference;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE T ANGLE_usubBorrow(T x, T y, ANGLE_VectorElemRef<T, N> borrow)
+{
+    T borrowValue;
+    T difference = ANGLE_usubBorrowImpl(x, y, borrowValue);
+    borrow.mRef = borrowValue;
+    return difference;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE T ANGLE_usubBorrow(T x, T y, ANGLE_DeviceVectorElemRef<T, N> borrow)
+{
+    T borrowValue;
+    T difference = ANGLE_usubBorrowImpl(x, y, borrowValue);
+    borrow.mRef = borrowValue;
+    return difference;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE metal::vec<T, SN> ANGLE_usubBorrow(metal::vec<T, SN> x,
+                                                      metal::vec<T, SN> y,
+                                                      ANGLE_SwizzleRef<T, VN, SN> borrow)
+{
+    metal::vec<T, SN> borrowValue;
+    metal::vec<T, SN> difference = ANGLE_usubBorrowImpl(x, y, borrowValue);
+    borrow.mRef = borrowValue;
+    return difference;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE metal::vec<T, SN> ANGLE_usubBorrow(
+    metal::vec<T, SN> x,
+    metal::vec<T, SN> y,
+    ANGLE_DeviceSwizzleRef<T, VN, SN> borrow)
+{
+    metal::vec<T, SN> borrowValue;
+    metal::vec<T, SN> difference = ANGLE_usubBorrowImpl(x, y, borrowValue);
+    borrow.mRef = borrowValue;
+    return difference;
+}
+)",
+                        swizzleRef())
+
+PROGRAM_PRELUDE_DECLARE(umulExtended,
+                        R"(
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtendedImpl(T x, T y, thread T &msb, thread T &lsb)
+{
+    lsb = x * y;
+    msb = metal::mulhi(x, y);
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(T x,
+                                            T y,
+                                            thread metal::conditional_t<true, T, T> &msb,
+                                            thread metal::conditional_t<true, T, T> &lsb)
+{
+    ANGLE_umulExtendedImpl(x, y, msb, lsb);
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(T x,
+                                            T y,
+                                            device metal::conditional_t<true, T, T> &msb,
+                                            device metal::conditional_t<true, T, T> &lsb)
+{
+    T msbValue;
+    T lsbValue;
+    ANGLE_umulExtendedImpl(x, y, msbValue, lsbValue);
+    msb = msbValue;
+    lsb = lsbValue;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(T x,
+                                            T y,
+                                            ANGLE_VectorElemRef<T, N> msb,
+                                            ANGLE_VectorElemRef<T, N> lsb)
+{
+    T msbValue;
+    T lsbValue;
+    ANGLE_umulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(T x,
+                                            T y,
+                                            ANGLE_DeviceVectorElemRef<T, N> msb,
+                                            ANGLE_DeviceVectorElemRef<T, N> lsb)
+{
+    T msbValue;
+    T lsbValue;
+    ANGLE_umulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(metal::vec<T, SN> x,
+                                            metal::vec<T, SN> y,
+                                            ANGLE_SwizzleRef<T, VN, SN> msb,
+                                            ANGLE_SwizzleRef<T, VN, SN> lsb)
+{
+    metal::vec<T, SN> msbValue;
+    metal::vec<T, SN> lsbValue;
+    ANGLE_umulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(metal::vec<T, SN> x,
+                                            metal::vec<T, SN> y,
+                                            ANGLE_DeviceSwizzleRef<T, VN, SN> msb,
+                                            ANGLE_DeviceSwizzleRef<T, VN, SN> lsb)
+{
+    metal::vec<T, SN> msbValue;
+    metal::vec<T, SN> lsbValue;
+    ANGLE_umulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+)",
+                        swizzleRef())
+
+PROGRAM_PRELUDE_DECLARE(imulExtended,
+                        R"(
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtendedImpl(T x, T y, thread T &msb, thread T &lsb)
+{
+    using U = metal::make_unsigned_t<T>;
+    lsb = as_type<T>(U(x) * U(y));
+    msb = metal::mulhi(x, y);
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x,
+                                            T y,
+                                            thread metal::conditional_t<true, T, T> &msb,
+                                            thread metal::conditional_t<true, T, T> &lsb)
+{
+    ANGLE_imulExtendedImpl(x, y, msb, lsb);
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x,
+                                            T y,
+                                            device metal::conditional_t<true, T, T> &msb,
+                                            device metal::conditional_t<true, T, T> &lsb)
+{
+    T msbValue;
+    T lsbValue;
+    ANGLE_imulExtendedImpl(x, y, msbValue, lsbValue);
+    msb = msbValue;
+    lsb = lsbValue;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x,
+                                            T y,
+                                            ANGLE_VectorElemRef<T, N> msb,
+                                            ANGLE_VectorElemRef<T, N> lsb)
+{
+    T msbValue;
+    T lsbValue;
+    ANGLE_imulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x,
+                                            T y,
+                                            ANGLE_DeviceVectorElemRef<T, N> msb,
+                                            ANGLE_DeviceVectorElemRef<T, N> lsb)
+{
+    T msbValue;
+    T lsbValue;
+    ANGLE_imulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(metal::vec<T, SN> x,
+                                            metal::vec<T, SN> y,
+                                            ANGLE_SwizzleRef<T, VN, SN> msb,
+                                            ANGLE_SwizzleRef<T, VN, SN> lsb)
+{
+    metal::vec<T, SN> msbValue;
+    metal::vec<T, SN> lsbValue;
+    ANGLE_imulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+template <typename T, int VN, int SN>
+ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(metal::vec<T, SN> x,
+                                            metal::vec<T, SN> y,
+                                            ANGLE_DeviceSwizzleRef<T, VN, SN> msb,
+                                            ANGLE_DeviceSwizzleRef<T, VN, SN> lsb)
+{
+    metal::vec<T, SN> msbValue;
+    metal::vec<T, SN> lsbValue;
+    ANGLE_imulExtendedImpl(x, y, msbValue, lsbValue);
+    msb.mRef = msbValue;
+    lsb.mRef = lsbValue;
+}
+)",
+                        swizzleRef())
+
+PROGRAM_PRELUDE_DECLARE(frexp,
+                        R"(
+#define ANGLE_DEFINE_FREXP(T, I)                                                          \
+    ANGLE_ALWAYS_INLINE T ANGLE_frexp(T x, thread I &exp)                               \
+    {                                                                                    \
+        return metal::frexp(x, exp);                                                     \
+    }                                                                                    \
+    ANGLE_ALWAYS_INLINE T ANGLE_frexp(T x, device I &exp)                               \
+    {                                                                                    \
+        I expValue;                                                                      \
+        T result = metal::frexp(x, expValue);                                           \
+        exp = expValue;                                                                  \
+        return result;                                                                   \
+    }                                                                                    \
+    ANGLE_ALWAYS_INLINE T ANGLE_frexp(constant const T &x, thread I &exp)               \
+    {                                                                                    \
+        T value = x;                                                                     \
+        return metal::frexp(value, exp);                                                 \
+    }                                                                                    \
+    ANGLE_ALWAYS_INLINE T ANGLE_frexp(constant const T &x, device I &exp)               \
+    {                                                                                    \
+        T value = x;                                                                     \
+        I expValue;                                                                      \
+        T result = metal::frexp(value, expValue);                                        \
+        exp = expValue;                                                                  \
+        return result;                                                                   \
+    }
+ANGLE_DEFINE_FREXP(float, int)
+ANGLE_DEFINE_FREXP(metal::float2, metal::int2)
+ANGLE_DEFINE_FREXP(metal::float3, metal::int3)
+ANGLE_DEFINE_FREXP(metal::float4, metal::int4)
+#undef ANGLE_DEFINE_FREXP
+)")
+
 // Shifting by a negative amount or by more than the bit width of the type is undefined in Metal,
 // and GLSL ES leaves the result undefined as well. Mask the shift amount so that it is always in
 // range, which matches what GPUs do natively and what the other ANGLE backends end up with. Note
@@ -620,6 +1041,10 @@ ANGLE_ALWAYS_INLINE int ANGLE_preIncrementInt(thread int &x) { x = ANGLE_addInt(
 ANGLE_ALWAYS_INLINE metal::int2 ANGLE_preIncrementInt(thread metal::int2 &x) { x = ANGLE_addInt(x, 1); return x; }
 ANGLE_ALWAYS_INLINE metal::int3 ANGLE_preIncrementInt(thread metal::int3 &x) { x = ANGLE_addInt(x, 1); return x; }
 ANGLE_ALWAYS_INLINE metal::int4 ANGLE_preIncrementInt(thread metal::int4 &x) { x = ANGLE_addInt(x, 1); return x; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_preIncrementInt(device T &x) { x = ANGLE_addInt(x, 1); return x; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_preIncrementInt(threadgroup T &x) { x = ANGLE_addInt(x, 1); return x; }
 )",
                         addInt())
 
@@ -629,6 +1054,10 @@ ANGLE_ALWAYS_INLINE int ANGLE_postIncrementInt(thread int &x) { int r = x; x = A
 ANGLE_ALWAYS_INLINE metal::int2 ANGLE_postIncrementInt(thread metal::int2 &x) { metal::int2 r = x; x = ANGLE_addInt(x, 1); return r; }
 ANGLE_ALWAYS_INLINE metal::int3 ANGLE_postIncrementInt(thread metal::int3 &x) { metal::int3 r = x; x = ANGLE_addInt(x, 1); return r; }
 ANGLE_ALWAYS_INLINE metal::int4 ANGLE_postIncrementInt(thread metal::int4 &x) { metal::int4 r = x; x = ANGLE_addInt(x, 1); return r; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_postIncrementInt(device T &x) { T r = x; x = ANGLE_addInt(x, 1); return r; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_postIncrementInt(threadgroup T &x) { T r = x; x = ANGLE_addInt(x, 1); return r; }
 )",
                         addInt())
 
@@ -638,6 +1067,10 @@ ANGLE_ALWAYS_INLINE int ANGLE_preDecrementInt(thread int &x) { x = ANGLE_subInt(
 ANGLE_ALWAYS_INLINE metal::int2 ANGLE_preDecrementInt(thread metal::int2 &x) { x = ANGLE_subInt(x, 1); return x; }
 ANGLE_ALWAYS_INLINE metal::int3 ANGLE_preDecrementInt(thread metal::int3 &x) { x = ANGLE_subInt(x, 1); return x; }
 ANGLE_ALWAYS_INLINE metal::int4 ANGLE_preDecrementInt(thread metal::int4 &x) { x = ANGLE_subInt(x, 1); return x; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_preDecrementInt(device T &x) { x = ANGLE_subInt(x, 1); return x; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_preDecrementInt(threadgroup T &x) { x = ANGLE_subInt(x, 1); return x; }
 )",
                         subInt())
 
@@ -647,6 +1080,10 @@ ANGLE_ALWAYS_INLINE int ANGLE_postDecrementInt(thread int &x) { int r = x; x = A
 ANGLE_ALWAYS_INLINE metal::int2 ANGLE_postDecrementInt(thread metal::int2 &x) { metal::int2 r = x; x = ANGLE_subInt(x, 1); return r; }
 ANGLE_ALWAYS_INLINE metal::int3 ANGLE_postDecrementInt(thread metal::int3 &x) { metal::int3 r = x; x = ANGLE_subInt(x, 1); return r; }
 ANGLE_ALWAYS_INLINE metal::int4 ANGLE_postDecrementInt(thread metal::int4 &x) { metal::int4 r = x; x = ANGLE_subInt(x, 1); return r; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_postDecrementInt(device T &x) { T r = x; x = ANGLE_subInt(x, 1); return r; }
+template <typename T>
+ANGLE_ALWAYS_INLINE T ANGLE_postDecrementInt(threadgroup T &x) { T r = x; x = ANGLE_subInt(x, 1); return r; }
 )",
                         subInt())
 
@@ -1114,6 +1551,25 @@ ANGLE_ALWAYS_INLINE ANGLE_VectorElemRef<T, N> ANGLE_elem_ref(thread metal::vec<T
 {
     return ANGLE_VectorElemRef<T, N>(vec, metal::clamp(index, 0, N - 1));
 }
+template <typename T, int N>
+struct ANGLE_DeviceVectorElemRef
+{
+    device metal::vec<T, N> &mVec;
+    T mRef;
+    const int mIndex;
+    ~ANGLE_DeviceVectorElemRef() { mVec[mIndex] = mRef; }
+    ANGLE_DeviceVectorElemRef(device metal::vec<T, N> &vec, int index)
+        : mVec(vec), mRef(vec[index]), mIndex(index)
+    {}
+    operator thread T &() thread { return mRef; }
+};
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE ANGLE_DeviceVectorElemRef<T, N> ANGLE_swizzle_ref(
+    device metal::vec<T, N> &vec,
+    int index)
+{
+    return ANGLE_DeviceVectorElemRef<T, N>(vec, metal::clamp(index, 0, N - 1));
+}
 )")
 
 PROGRAM_PRELUDE_DECLARE(swizzleRef,
@@ -1167,6 +1623,62 @@ ANGLE_ALWAYS_INLINE ANGLE_SwizzleRef<T, N, 4> ANGLE_swizzle_ref(thread metal::ve
     const int is[] = { i0, i1, i2, i3 };
     return ANGLE_SwizzleRef<T, N, 4>(vec, is);
 }
+template <typename T, int VN, int SN>
+struct ANGLE_DeviceSwizzleRef
+{
+    device metal::vec<T, VN> &mVec;
+    metal::vec<T, SN> mRef;
+    int mIndices[SN];
+    ~ANGLE_DeviceSwizzleRef()
+    {
+        for (int i = 0; i < SN; ++i)
+        {
+            const int j = mIndices[i];
+            mVec[j] = mRef[i];
+        }
+    }
+    ANGLE_DeviceSwizzleRef(device metal::vec<T, VN> &vec, thread const int *indices)
+        : mVec(vec)
+    {
+        for (int i = 0; i < SN; ++i)
+        {
+            const int j = indices[i];
+            mIndices[i] = j;
+            mRef[i] = mVec[j];
+        }
+    }
+    operator thread metal::vec<T, SN> &() thread { return mRef; }
+};
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE ANGLE_DeviceSwizzleRef<T, N, 2> ANGLE_swizzle_ref(
+    device metal::vec<T, N> &vec,
+    int i0,
+    int i1)
+{
+    const int is[] = { i0, i1 };
+    return ANGLE_DeviceSwizzleRef<T, N, 2>(vec, is);
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE ANGLE_DeviceSwizzleRef<T, N, 3> ANGLE_swizzle_ref(
+    device metal::vec<T, N> &vec,
+    int i0,
+    int i1,
+    int i2)
+{
+    const int is[] = { i0, i1, i2 };
+    return ANGLE_DeviceSwizzleRef<T, N, 3>(vec, is);
+}
+template <typename T, int N>
+ANGLE_ALWAYS_INLINE ANGLE_DeviceSwizzleRef<T, N, 4> ANGLE_swizzle_ref(
+    device metal::vec<T, N> &vec,
+    int i0,
+    int i1,
+    int i2,
+    int i3)
+{
+    const int is[] = { i0, i1, i2, i3 };
+    return ANGLE_DeviceSwizzleRef<T, N, 4>(vec, is);
+}
 )",
                         vectorElemRef())
 
@@ -1186,6 +1698,22 @@ template <typename T>
 ANGLE_ALWAYS_INLINE ANGLE_Out<T> ANGLE_out(thread T &dest)
 {
     return ANGLE_Out<T>(dest);
+}
+template <typename T>
+struct ANGLE_DeviceOut
+{
+    T mTemp;
+    device T &mDest;
+    ~ANGLE_DeviceOut() { mDest = mTemp; }
+    ANGLE_DeviceOut(device T &dest)
+        : mTemp(dest), mDest(dest)
+    {}
+    operator thread T &() thread { return mTemp; }
+};
+template <typename T>
+ANGLE_ALWAYS_INLINE ANGLE_DeviceOut<T> ANGLE_out(device T &dest)
+{
+    return ANGLE_DeviceOut<T>(dest);
 }
 )")
 
@@ -1359,6 +1887,18 @@ ANGLE_ALWAYS_INLINE auto ANGLE_texelFetch(
     int const level)
 {
     return env.texture->read(uint2(coord), uint32_t(level));
+}
+)",
+                        textureEnv())
+
+PROGRAM_PRELUDE_DECLARE(texelFetch_buffer,
+                        R"(
+template <typename T>
+ANGLE_ALWAYS_INLINE auto ANGLE_texelFetch(
+    thread ANGLE_TextureEnv<metal::texture_buffer<T>> &env,
+    int const coord)
+{
+    return env.texture->read(uint32_t(coord));
 }
 )",
                         textureEnv())
@@ -2911,26 +3451,622 @@ ANGLE_ALWAYS_INLINE auto ANGLE_textureSize(
 )",
                         textureEnv())
 
+PROGRAM_PRELUDE_DECLARE(textureSize_buffer,
+                        R"(
+template <typename T>
+ANGLE_ALWAYS_INLINE auto ANGLE_textureSize(
+    thread ANGLE_TextureEnv<metal::texture_buffer<T>> &env)
+{
+    return int(env.texture->get_width());
+}
+)",
+                        textureEnv())
+
+PROGRAM_PRELUDE_DECLARE(imageSize, R"(
+#if __METAL_VERSION__ >= 320
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE , metal::memory_coherence Coherence = metal::memory_coherence_threadgroup
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT , Coherence
+#else
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT
+#endif
+
+template <typename T, metal::access Access>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(
+    thread const metal::texture_buffer<T, Access> &texture)
+{
+    return int(texture.get_width());
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(
+    thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{
+    return int2(texture.get_width(), texture.get_height());
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(
+    thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture2D,
+    thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture3D,
+    uint32_t layer)
+{
+    if (layer == 0xFFFFFFFFu)
+    {
+        return int2(texture2D.get_width(), texture2D.get_height());
+    }
+    return int2(texture3D.get_width(), texture3D.get_height());
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(
+    thread const metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{
+    return int3(texture.get_width(), texture.get_height(), texture.get_array_size());
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(
+    thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{
+    return int3(texture.get_width(), texture.get_height(), texture.get_depth());
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(
+    thread const metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{
+    return int2(texture.get_width(), texture.get_height());
+}
+#undef ANGLE_IMAGE_COHERENCE_TEMPLATE
+#undef ANGLE_IMAGE_COHERENCE_ARGUMENT
+)")
+
 PROGRAM_PRELUDE_DECLARE(imageLoad, R"(
+#if __METAL_VERSION__ >= 320
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE , metal::memory_coherence Coherence = metal::memory_coherence_threadgroup
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT , Coherence
+#else
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT
+#endif
+
+template <typename T, metal::access Access>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture_buffer<T, Access> &texture)
+{}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture_buffer<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture2d<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture2d_array<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture3d<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texturecube<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+#if __METAL_VERSION__ >= 320
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture2d<T, metal::access::read_write, metal::memory_coherence_device> &texture)
+{
+    texture.fence();
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture2d_array<T, metal::access::read_write,
+                                  metal::memory_coherence_device> &texture)
+{
+    texture.fence();
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texture3d<T, metal::access::read_write, metal::memory_coherence_device> &texture)
+{
+    texture.fence();
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureReadFence(
+    thread metal::texturecube<T, metal::access::read_write,
+                              metal::memory_coherence_device> &texture)
+{
+    texture.fence();
+}
+#endif
+
 template <typename T, metal::access Access>
 ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
-    thread const metal::texture2d<T, Access> &texture,
+    thread metal::texture_buffer<T, Access> &texture,
+    int coord)
+{
+    ANGLE_textureReadFence(texture);
+    return texture.read(uint32_t(coord));
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+    thread metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
     metal::int2 coord)
 {
+    ANGLE_textureReadFence(texture);
     return texture.read(uint2(coord));
 }
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+    thread metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture2D,
+    thread metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture3D,
+    uint32_t layer,
+    metal::int2 coord)
+{
+    if (layer == 0xFFFFFFFFu)
+    {
+        ANGLE_textureReadFence(texture2D);
+        return texture2D.read(uint2(coord));
+    }
+    ANGLE_textureReadFence(texture3D);
+    return texture3D.read(uint3(uint2(coord), layer));
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+    thread metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord)
+{
+    ANGLE_textureReadFence(texture);
+    return texture.read(uint2(coord.xy), uint(coord.z));
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+    thread metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord)
+{
+    ANGLE_textureReadFence(texture);
+    return texture.read(uint3(coord));
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+    thread metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord)
+{
+    ANGLE_textureReadFence(texture);
+    return texture.read(uint2(coord.xy), uint(coord.z));
+}
+#undef ANGLE_IMAGE_COHERENCE_TEMPLATE
+#undef ANGLE_IMAGE_COHERENCE_ARGUMENT
 )")
 
 PROGRAM_PRELUDE_DECLARE(imageStore, R"(
+#if __METAL_VERSION__ >= 320
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE , metal::memory_coherence Coherence = metal::memory_coherence_threadgroup
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT , Coherence
+#else
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT
+#endif
+
 template <typename T, metal::access Access>
-ANGLE_ALWAYS_INLINE auto ANGLE_imageStore(
-    thread const metal::texture2d<T, Access> &texture,
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture_buffer<T, Access> &texture)
+{}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture_buffer<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture)
+{}
+#if __METAL_VERSION__ >= 320
+template <typename T, metal::memory_coherence Coherence>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture2d<T, metal::access::read_write, Coherence> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::memory_coherence Coherence>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture2d_array<T, metal::access::read_write, Coherence> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::memory_coherence Coherence>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture3d<T, metal::access::read_write, Coherence> &texture)
+{
+    texture.fence();
+}
+template <typename T, metal::memory_coherence Coherence>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texturecube<T, metal::access::read_write, Coherence> &texture)
+{
+    texture.fence();
+}
+#else
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture2d<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture2d_array<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texture3d<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+template <typename T>
+ANGLE_ALWAYS_INLINE void ANGLE_textureWriteFence(
+    thread metal::texturecube<T, metal::access::read_write> &texture)
+{
+    texture.fence();
+}
+#endif
+
+template <typename T, metal::access Access>
+ANGLE_ALWAYS_INLINE void ANGLE_imageStore(
+    thread metal::texture_buffer<T, Access> &texture,
+    int coord,
+    metal::vec<T, 4> value)
+{
+    texture.write(value, uint32_t(coord));
+    ANGLE_textureWriteFence(texture);
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_imageStore(
+    thread metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
     metal::int2 coord,
     metal::vec<T, 4> value)
 {
-    return texture.write(value, uint2(coord));
+    texture.write(value, uint2(coord));
+    ANGLE_textureWriteFence(texture);
 }
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_imageStore(
+    thread metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture2D,
+    thread metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture3D,
+    uint32_t layer,
+    metal::int2 coord,
+    metal::vec<T, 4> value)
+{
+    if (layer == 0xFFFFFFFFu)
+    {
+        texture2D.write(value, uint2(coord));
+        ANGLE_textureWriteFence(texture2D);
+        return;
+    }
+    texture3D.write(value, uint3(uint2(coord), layer));
+    ANGLE_textureWriteFence(texture3D);
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_imageStore(
+    thread metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord,
+    metal::vec<T, 4> value)
+{
+    texture.write(value, uint2(coord.xy), uint(coord.z));
+    ANGLE_textureWriteFence(texture);
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_imageStore(
+    thread metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord,
+    metal::vec<T, 4> value)
+{
+    texture.write(value, uint3(coord));
+    ANGLE_textureWriteFence(texture);
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE void ANGLE_imageStore(
+    thread metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord,
+    metal::vec<T, 4> value)
+{
+    texture.write(value, uint2(coord.xy), uint(coord.z));
+    ANGLE_textureWriteFence(texture);
+}
+#undef ANGLE_IMAGE_COHERENCE_TEMPLATE
+#undef ANGLE_IMAGE_COHERENCE_ARGUMENT
 )")
+
+PROGRAM_PRELUDE_DECLARE(imageAtomic, R"(
+#define ANGLE_REQUIRES_MSL_3_1 1
+#if __METAL_VERSION__ >= 320
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE , metal::memory_coherence Coherence = metal::memory_coherence_threadgroup
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT , Coherence
+#else
+#define ANGLE_IMAGE_COHERENCE_TEMPLATE
+#define ANGLE_IMAGE_COHERENCE_ARGUMENT
+#endif
+
+ANGLE_ALWAYS_INLINE void ANGLE_imageAtomicFence()
+{
+#if __METAL_VERSION__ >= 320
+    metal::atomic_thread_fence(metal::mem_flags::mem_device | metal::mem_flags::mem_texture,
+                               metal::memory_order_seq_cst, metal::thread_scope_thread);
+#endif
+}
+
+#define ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(NAME, METHOD)                                      \
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomic##NAME(                                            \
+    thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,     \
+    metal::int2 coord, T operand)                                                         \
+{                                                                                         \
+    if (coord.x < 0 || coord.y < 0 || uint32_t(coord.x) >= texture.get_width() ||         \
+        uint32_t(coord.y) >= texture.get_height())                                         \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    ANGLE_imageAtomicFence();                                                             \
+    T result = texture.METHOD(metal::uint2(coord), operand).x;                            \
+    ANGLE_imageAtomicFence();                                                             \
+    return result;                                                                        \
+}                                                                                         \
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomic##NAME(                                            \
+    thread const metal::texture_buffer<T, Access> &texture, int coord, T operand)         \
+{                                                                                         \
+    if (coord < 0 || uint32_t(coord) >= texture.get_width())                              \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    ANGLE_imageAtomicFence();                                                             \
+    T result = texture.METHOD(uint32_t(coord), operand).x;                                \
+    ANGLE_imageAtomicFence();                                                             \
+    return result;                                                                        \
+}                                                                                         \
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomic##NAME(                                            \
+    thread const metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture, \
+    metal::int3 coord, T operand)                                                         \
+{                                                                                         \
+    if (coord.x < 0 || coord.y < 0 || coord.z < 0 ||                                     \
+        uint32_t(coord.x) >= texture.get_width() ||                                       \
+        uint32_t(coord.y) >= texture.get_height() ||                                      \
+        uint32_t(coord.z) >= texture.get_array_size())                                    \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    ANGLE_imageAtomicFence();                                                             \
+    T result = texture.METHOD(metal::uint2(coord.xy), uint32_t(coord.z), operand).x;      \
+    ANGLE_imageAtomicFence();                                                             \
+    return result;                                                                        \
+}                                                                                         \
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomic##NAME(                                            \
+    thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,     \
+    metal::int3 coord, T operand)                                                         \
+{                                                                                         \
+    if (coord.x < 0 || coord.y < 0 || coord.z < 0 ||                                     \
+        uint32_t(coord.x) >= texture.get_width() ||                                       \
+        uint32_t(coord.y) >= texture.get_height() ||                                      \
+        uint32_t(coord.z) >= texture.get_depth())                                          \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    ANGLE_imageAtomicFence();                                                             \
+    T result = texture.METHOD(metal::uint3(coord), operand).x;                            \
+    ANGLE_imageAtomicFence();                                                             \
+    return result;                                                                        \
+}                                                                                         \
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomic##NAME(                                            \
+    thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture2D,   \
+    thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture3D,   \
+    uint32_t layer,                                                                       \
+    metal::int2 coord, T operand)                                                         \
+{                                                                                         \
+    if (layer == 0xFFFFFFFFu)                                                             \
+    {                                                                                     \
+        return ANGLE_imageAtomic##NAME(texture2D, coord, operand);                        \
+    }                                                                                     \
+    if (coord.x < 0 || coord.y < 0 || uint32_t(coord.x) >= texture3D.get_width() ||       \
+        uint32_t(coord.y) >= texture3D.get_height() || layer >= texture3D.get_depth())     \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    ANGLE_imageAtomicFence();                                                             \
+    T result = texture3D.METHOD(metal::uint3(metal::uint2(coord), layer), operand).x;      \
+    ANGLE_imageAtomicFence();                                                             \
+    return result;                                                                        \
+}
+
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(Add, atomic_fetch_add)
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(Min, atomic_fetch_min)
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(Max, atomic_fetch_max)
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(And, atomic_fetch_and)
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(Or, atomic_fetch_or)
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(Xor, atomic_fetch_xor)
+ANGLE_DEFINE_IMAGE_ATOMIC_FETCH(Exchange, atomic_exchange)
+#undef ANGLE_DEFINE_IMAGE_ATOMIC_FETCH
+
+#define ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP(TEXTURE_TYPE, COORD_TYPE, ...)                 \
+template <typename T, metal::access Access>                                                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomicCompSwap(                                          \
+    thread const TEXTURE_TYPE<T, Access> &texture, COORD_TYPE coord, T compare, T desired) \
+{                                                                                         \
+    if (!ANGLE_imageAtomicCoordInBounds(texture, coord))                                  \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    metal::vec<T, 4> expected(compare);                                                    \
+    while (true)                                                                          \
+    {                                                                                     \
+        expected = metal::vec<T, 4>(compare);                                              \
+        if (texture.atomic_compare_exchange_weak(__VA_ARGS__, &expected, desired) ||       \
+            expected.x != compare)                                                        \
+        {                                                                                 \
+            return expected.x;                                                            \
+        }                                                                                 \
+    }                                                                                      \
+}
+
+#define ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP_COHERENT(TEXTURE_TYPE, COORD_TYPE, ...)       \
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>                \
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomicCompSwap(                                          \
+    thread const TEXTURE_TYPE<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,          \
+    COORD_TYPE coord, T compare, T desired)                                                \
+{                                                                                         \
+    if (!ANGLE_imageAtomicCoordInBounds(texture, coord))                                  \
+    {                                                                                     \
+        return T(0);                                                                       \
+    }                                                                                     \
+    metal::vec<T, 4> expected(compare);                                                    \
+    while (true)                                                                          \
+    {                                                                                     \
+        expected = metal::vec<T, 4>(compare);                                              \
+        ANGLE_imageAtomicFence();                                                         \
+        if (texture.atomic_compare_exchange_weak(__VA_ARGS__, &expected, desired) ||       \
+            expected.x != compare)                                                        \
+        {                                                                                 \
+            ANGLE_imageAtomicFence();                                                     \
+            return expected.x;                                                            \
+        }                                                                                 \
+    }                                                                                      \
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE bool ANGLE_imageAtomicCoordInBounds(
+    thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int2 coord)
+{
+    return coord.x >= 0 && coord.y >= 0 && uint32_t(coord.x) < texture.get_width() &&
+           uint32_t(coord.y) < texture.get_height();
+}
+
+template <typename T, metal::access Access>
+ANGLE_ALWAYS_INLINE bool ANGLE_imageAtomicCoordInBounds(
+    thread const metal::texture_buffer<T, Access> &texture, int coord)
+{
+    return coord >= 0 && uint32_t(coord) < texture.get_width();
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE bool ANGLE_imageAtomicCoordInBounds(
+    thread const metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord)
+{
+    return coord.x >= 0 && coord.y >= 0 && coord.z >= 0 &&
+           uint32_t(coord.x) < texture.get_width() && uint32_t(coord.y) < texture.get_height() &&
+           uint32_t(coord.z) < texture.get_array_size();
+}
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE bool ANGLE_imageAtomicCoordInBounds(
+    thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture,
+    metal::int3 coord)
+{
+    return coord.x >= 0 && coord.y >= 0 && coord.z >= 0 &&
+           uint32_t(coord.x) < texture.get_width() && uint32_t(coord.y) < texture.get_height() &&
+           uint32_t(coord.z) < texture.get_depth();
+}
+
+ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP(metal::texture_buffer, int, uint32_t(coord))
+ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP_COHERENT(metal::texture2d, metal::int2,
+                                             metal::uint2(coord))
+ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP_COHERENT(metal::texture2d_array, metal::int3,
+                                             metal::uint2(coord.xy), uint32_t(coord.z))
+ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP_COHERENT(metal::texture3d, metal::int3, metal::uint3(coord))
+#undef ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP
+#undef ANGLE_DEFINE_IMAGE_ATOMIC_COMP_SWAP_COHERENT
+
+template <typename T, metal::access Access ANGLE_IMAGE_COHERENCE_TEMPLATE>
+ANGLE_ALWAYS_INLINE T ANGLE_imageAtomicCompSwap(
+    thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture2D,
+    thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE_ARGUMENT> &texture3D,
+    uint32_t layer, metal::int2 coord,
+    T compare, T desired)
+{
+    if (layer == 0xFFFFFFFFu)
+    {
+        return ANGLE_imageAtomicCompSwap(texture2D, coord, compare, desired);
+    }
+    if (coord.x < 0 || coord.y < 0 || uint32_t(coord.x) >= texture3D.get_width() ||
+        uint32_t(coord.y) >= texture3D.get_height() || layer >= texture3D.get_depth())
+    {
+        return T(0);
+    }
+    metal::vec<T, 4> expected(compare);
+    while (true)
+    {
+        expected = metal::vec<T, 4>(compare);
+        ANGLE_imageAtomicFence();
+        if (texture3D.atomic_compare_exchange_weak(
+                metal::uint3(metal::uint2(coord), layer), &expected, desired) ||
+            expected.x != compare)
+        {
+            ANGLE_imageAtomicFence();
+            return expected.x;
+        }
+    }
+}
+#undef ANGLE_IMAGE_COHERENCE_TEMPLATE
+#undef ANGLE_IMAGE_COHERENCE_ARGUMENT
+)" )
 
 // TODO(anglebug.com/40096838): When using raster order groups and pixel local storage, which only
 // accesses the pixel coordinate, we probably only need an execution barrier (mem_flags::mem_none).
@@ -2938,6 +4074,96 @@ PROGRAM_PRELUDE_DECLARE(memoryBarrierImage, R"(
 ANGLE_ALWAYS_INLINE void ANGLE_memoryBarrierImage()
 {
     simdgroup_barrier(metal::mem_flags::mem_texture);
+}
+)")
+
+PROGRAM_PRELUDE_DECLARE(computeBarrier, R"(
+ANGLE_ALWAYS_INLINE void ANGLE_barrier()
+{
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_texture);
+}
+)")
+
+PROGRAM_PRELUDE_DECLARE(computeMemoryBarrier, R"(
+ANGLE_ALWAYS_INLINE void ANGLE_memoryBarrier()
+{
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);
+}
+)")
+
+PROGRAM_PRELUDE_DECLARE(graphicsMemoryBarrier, R"(
+ANGLE_ALWAYS_INLINE void ANGLE_memoryBarrier()
+{
+#if __METAL_VERSION__ >= 320
+    metal::atomic_thread_fence(metal::mem_flags::mem_device | metal::mem_flags::mem_texture,
+                               metal::memory_order_seq_cst, metal::thread_scope_thread);
+#endif
+}
+)")
+
+PROGRAM_PRELUDE_DECLARE(atomicCompSwap, R"(
+ANGLE_ALWAYS_INLINE uint ANGLE_atomicCompSwap(
+    volatile threadgroup metal::atomic_uint *object, uint compare, uint desired)
+{
+    uint expected = compare;
+    while (expected == compare)
+    {
+        if (metal::atomic_compare_exchange_weak_explicit(
+                object, &expected, desired, metal::memory_order_relaxed,
+                metal::memory_order_relaxed))
+        {
+            return compare;
+        }
+    }
+    return expected;
+}
+
+ANGLE_ALWAYS_INLINE uint ANGLE_atomicCompSwap(
+    volatile device metal::atomic_uint *object, uint compare, uint desired)
+{
+    uint expected = compare;
+    while (expected == compare)
+    {
+        if (metal::atomic_compare_exchange_weak_explicit(
+                object, &expected, desired, metal::memory_order_relaxed,
+                metal::memory_order_relaxed))
+        {
+            return compare;
+        }
+    }
+    return expected;
+}
+
+ANGLE_ALWAYS_INLINE int ANGLE_atomicCompSwap(
+    volatile threadgroup metal::atomic_int *object, int compare, int desired)
+{
+    int expected = compare;
+    while (expected == compare)
+    {
+        if (metal::atomic_compare_exchange_weak_explicit(
+                object, &expected, desired, metal::memory_order_relaxed,
+                metal::memory_order_relaxed))
+        {
+            return compare;
+        }
+    }
+    return expected;
+}
+
+ANGLE_ALWAYS_INLINE int ANGLE_atomicCompSwap(
+    volatile device metal::atomic_int *object, int compare, int desired)
+{
+    int expected = compare;
+    while (expected == compare)
+    {
+        if (metal::atomic_compare_exchange_weak_explicit(
+                object, &expected, desired, metal::memory_order_relaxed,
+                metal::memory_order_relaxed))
+        {
+            return compare;
+        }
+    }
+    return expected;
 }
 )")
 
@@ -3068,6 +4294,10 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
     putBuiltIn("texelFetch", [](ProgramPrelude &pp, const TFunction &func) {
         switch (func.getParam(0)->getType().getBasicType())
         {
+            case EbtSamplerBuffer:
+            case EbtISamplerBuffer:
+            case EbtUSamplerBuffer:
+                return pp.texelFetch_buffer();
             case EbtSampler2D:
             case EbtISampler2D:
             case EbtUSampler2D:
@@ -3453,6 +4683,10 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
     putBuiltIn("textureSize", [](ProgramPrelude &pp, const TFunction &func) {
         switch (func.getParam(0)->getType().getBasicType())
         {
+            case EbtSamplerBuffer:
+            case EbtISamplerBuffer:
+            case EbtUSamplerBuffer:
+                return pp.textureSize_buffer();
             case EbtSampler3D:
             case EbtISampler3D:
             case EbtUSampler3D:
@@ -3472,8 +4706,17 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
                 return pp.textureSize_2D();
         }
     });
+    putBuiltIn("imageSize", EMIT_METHOD(imageSize));
     putBuiltIn("imageLoad", EMIT_METHOD(imageLoad));
     putBuiltIn("imageStore", EMIT_METHOD(imageStore));
+    putBuiltIn("imageAtomicAdd", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicMin", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicMax", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicAnd", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicOr", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicXor", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicExchange", EMIT_METHOD(imageAtomic));
+    putBuiltIn("imageAtomicCompSwap", EMIT_METHOD(imageAtomic));
     putBuiltIn("memoryBarrierImage", EMIT_METHOD(memoryBarrierImage));
 
     putBuiltIn("interpolateAtCenter", EMIT_METHOD(interpolateAtCenter));
@@ -3573,8 +4816,10 @@ void ProgramPrelude::visitOperator(TOperator op,
         case TOperator::EOpSaturate:
         case TOperator::EOpModf:
         case TOperator::EOpLdexp:
-        case TOperator::EOpFrexp:
         case TOperator::EOpInversesqrt:
+            break;
+        case TOperator::EOpFrexp:
+            frexp();
             break;
 
         case TOperator::EOpEqual:
@@ -3915,19 +5160,45 @@ void ProgramPrelude::visitOperator(TOperator op,
         case TOperator::EOpBitfieldExtract:
         case TOperator::EOpBitfieldInsert:
         case TOperator::EOpBitfieldReverse:
+            break;
         case TOperator::EOpBitCount:
+            bitCount();
+            break;
         case TOperator::EOpFindLSB:
+            findLSB();
+            break;
         case TOperator::EOpFindMSB:
+            findMSB();
+            break;
         case TOperator::EOpUaddCarry:
+            uaddCarry();
+            break;
         case TOperator::EOpUsubBorrow:
+            usubBorrow();
+            break;
         case TOperator::EOpUmulExtended:
+            umulExtended();
+            break;
         case TOperator::EOpImulExtended:
+            imulExtended();
+            break;
         case TOperator::EOpBarrier:
+            computeBarrier();
+            break;
         case TOperator::EOpMemoryBarrier:
         case TOperator::EOpMemoryBarrierAtomicCounter:
         case TOperator::EOpMemoryBarrierBuffer:
         case TOperator::EOpMemoryBarrierShared:
         case TOperator::EOpGroupMemoryBarrier:
+            if (mShaderType == MetalShaderType::Compute)
+            {
+                computeMemoryBarrier();
+            }
+            else
+            {
+                graphicsMemoryBarrier();
+            }
+            break;
         case TOperator::EOpAtomicAdd:
         case TOperator::EOpAtomicMin:
         case TOperator::EOpAtomicMax:
@@ -3935,11 +5206,17 @@ void ProgramPrelude::visitOperator(TOperator op,
         case TOperator::EOpAtomicOr:
         case TOperator::EOpAtomicXor:
         case TOperator::EOpAtomicExchange:
+            break;
         case TOperator::EOpAtomicCompSwap:
+            atomicCompSwap();
+            break;
         case TOperator::EOpEmitVertex:
         case TOperator::EOpEndPrimitive:
-        case TOperator::EOpArrayLength:
             UNIMPLEMENTED();
+            break;
+        case TOperator::EOpArrayLength:
+            // The MSL emitter lowers this directly to the SSBO length metadata supplied by the
+            // runtime, so no prelude helper is needed.
             break;
 
         case TOperator::EOpConstruct:

@@ -141,6 +141,8 @@ class TextureMtl : public TextureImpl
                                    egl::Stream *stream,
                                    const egl::Stream::GLTextureDescription &desc) override;
 
+    angle::Result setBuffer(const gl::Context *context, GLenum internalFormat) override;
+
     angle::Result generateMipmap(const gl::Context *context) override;
 
     angle::Result setBaseLevel(const gl::Context *context, GLuint baseLevel) override;
@@ -180,6 +182,11 @@ class TextureMtl : public TextureImpl
                                gl::Sampler *sampler, /** nullable */
                                int textureSlotIndex,
                                int samplerSlotIndex);
+    angle::Result bindToShader(const gl::Context *context,
+                               mtl::ComputeCommandEncoder *cmdEncoder,
+                               gl::Sampler *sampler, /** nullable */
+                               int textureSlotIndex,
+                               int samplerSlotIndex);
 
     angle::Result bindToShaderImage(const gl::Context *context,
                                     mtl::RenderCommandEncoder *cmdEncoder,
@@ -187,7 +194,43 @@ class TextureMtl : public TextureImpl
                                     int textureSlotIndex,
                                     int level,
                                     int layer,
-                                    GLenum format);
+                                    GLenum format,
+                                    GLenum access);
+    angle::Result bindToShaderImage(const gl::Context *context,
+                                    mtl::ComputeCommandEncoder *cmdEncoder,
+                                    int textureSlotIndex,
+                                    int level,
+                                    int layer,
+                                    GLenum format,
+                                    GLenum access);
+    angle::Result bindToShaderImageAs3D(const gl::Context *context,
+                                        mtl::RenderCommandEncoder *cmdEncoder,
+                                        gl::ShaderType shaderType,
+                                        int textureSlotIndex,
+                                        int level,
+                                        GLenum format,
+                                        GLenum access);
+    angle::Result bindToShaderImageAs3D(const gl::Context *context,
+                                        mtl::ComputeCommandEncoder *cmdEncoder,
+                                        int textureSlotIndex,
+                                        int level,
+                                        GLenum format,
+                                        GLenum access);
+    angle::Result bindToShaderImageLayered(const gl::Context *context,
+                                           mtl::RenderCommandEncoder *cmdEncoder,
+                                           gl::ShaderType shaderType,
+                                           int textureSlotIndex,
+                                           int level,
+                                           gl::TextureType imageType,
+                                           GLenum format,
+                                           GLenum access);
+    angle::Result bindToShaderImageLayered(const gl::Context *context,
+                                           mtl::ComputeCommandEncoder *cmdEncoder,
+                                           int textureSlotIndex,
+                                           int level,
+                                           gl::TextureType imageType,
+                                           GLenum format,
+                                           GLenum access);
 
   private:
     void deallocateNativeStorage(bool keepImages, bool keepSamplerStateAndFormat = false);
@@ -197,6 +240,10 @@ class TextureMtl : public TextureImpl
                                       GLuint samples,
                                       const gl::Extents &size,
                                       const mtl::Format &format);
+    angle::Result ensureBufferTextureCreated(const gl::Context *context,
+                                             MTLTextureUsage usage,
+                                             GLenum viewFormat,
+                                             mtl::TextureRef *textureOut);
     angle::Result onBaseMaxLevelsChanged(const gl::Context *context);
     // Number of native mip levels the storage should be allocated with, starting at the effective
     // base level. With ImageMipLevels::EnabledLevels this is limited to the contiguous levels that
@@ -205,6 +252,7 @@ class TextureMtl : public TextureImpl
     // max level is returned (for glGenerateMipmap).
     GLuint getStorageMipLevelCount(ImageMipLevels mipLevels) const;
     angle::Result ensureSamplerStateCreated(const gl::Context *context);
+    mtl::TextureRef getTextureForSampling(const gl::Context *context);
     // Ensure image at given index is created:
     angle::Result ensureImageCreated(const gl::Context *context, const gl::ImageIndex &index);
     // Ensure all image views at all faces/levels are retained.
@@ -376,12 +424,23 @@ class TextureMtl : public TextureImpl
     // May have different formats than the original texture.
     // Indexed by format, then layer, then level.
     std::map<MTLPixelFormat, LayerLevelTextureViewVector> mShaderImageViews;
+    // Lazily populated full layered views for image2DArray, image3D, and imageCube.
+    // Indexed by format, then level.
+    std::map<MTLPixelFormat, TextureViewVector> mShaderLayeredImageViews;
 
     // Mipmap views are indexed from (base GL level -> max GL level):
     mtl::NativeTexLevelArray mLevelViewsWithinBaseMax;
 
     // The swizzled or stencil view used for shader sampling.
     mtl::TextureRef mSwizzleStencilSamplingView;
+
+    // Buffer textures are views of the currently allocated Metal buffer. Keep that allocation
+    // alive for command buffers that still reference the corresponding texture view.
+    mtl::BufferRef mBufferTextureSourceBuffer;
+    size_t mBufferTextureOffset = 0;
+    size_t mBufferTextureSize = 0;
+    GLenum mBufferTextureInternalFormat = GL_NONE;
+    std::map<std::pair<uint32_t, GLenum>, mtl::TextureRef> mBufferTextureViews;
 };
 
 }  // namespace rx

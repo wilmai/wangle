@@ -1272,6 +1272,12 @@ CommandEncoder &CommandEncoder::markResourceBeingWrittenByGPU(const BufferRef &b
     return *this;
 }
 
+CommandEncoder &CommandEncoder::markResourceBeingReadByGPU(const BufferRef &buffer)
+{
+    cmdBuffer().setReadDependency(buffer, isRenderEncoder());
+    return *this;
+}
+
 CommandEncoder &CommandEncoder::markResourceBeingWrittenByGPU(const TextureRef &texture)
 {
     cmdBuffer().setWriteDependency(texture, isRenderEncoder());
@@ -2064,7 +2070,7 @@ RenderCommandEncoder &RenderCommandEncoder::setTexture(gl::ShaderType shaderType
                                                        const TextureRef &texture,
                                                        uint32_t index)
 {
-    if (index >= kMaxShaderSamplers)
+    if (index >= kMaxShaderTextureBindings)
     {
         return *this;
     }
@@ -2091,7 +2097,7 @@ RenderCommandEncoder &RenderCommandEncoder::setRWTexture(gl::ShaderType shaderTy
                                                          const TextureRef &texture,
                                                          uint32_t index)
 {
-    if (index >= kMaxShaderSamplers)
+    if (index >= kMaxShaderTextureBindings)
     {
         return *this;
     }
@@ -2726,6 +2732,32 @@ ComputeCommandEncoder &ComputeCommandEncoder::setBufferForWrite(const BufferRef 
     return setBuffer(buffer, offset, index);
 }
 
+ComputeCommandEncoder &ComputeCommandEncoder::useResource(const BufferRef &resource,
+                                                          MTLResourceUsage usage)
+{
+    if (!resource)
+    {
+        return *this;
+    }
+
+    cmdBuffer().setReadDependency(resource, /*isRenderCommand=*/false);
+    [get() useResource:resource->get() usage:usage];
+    return *this;
+}
+
+ComputeCommandEncoder &ComputeCommandEncoder::useResource(const TextureRef &resource,
+                                                          MTLResourceUsage usage)
+{
+    if (!resource)
+    {
+        return *this;
+    }
+
+    cmdBuffer().setReadDependency(resource, /*isRenderCommand=*/false);
+    [get() useResource:resource->get() usage:usage];
+    return *this;
+}
+
 ComputeCommandEncoder &ComputeCommandEncoder::setBytes(const void *bytes,
                                                        size_t size,
                                                        uint32_t index)
@@ -2756,7 +2788,7 @@ ComputeCommandEncoder &ComputeCommandEncoder::setSamplerState(id<MTLSamplerState
 }
 ComputeCommandEncoder &ComputeCommandEncoder::setTexture(const TextureRef &texture, uint32_t index)
 {
-    if (index >= kMaxShaderSamplers)
+    if (index >= kMaxShaderTextureBindings)
     {
         return *this;
     }
@@ -2769,7 +2801,7 @@ ComputeCommandEncoder &ComputeCommandEncoder::setTexture(const TextureRef &textu
 ComputeCommandEncoder &ComputeCommandEncoder::setTextureForWrite(const TextureRef &texture,
                                                                  uint32_t index)
 {
-    if (index >= kMaxShaderSamplers)
+    if (index >= kMaxShaderTextureBindings)
     {
         return *this;
     }
@@ -2782,6 +2814,17 @@ ComputeCommandEncoder &ComputeCommandEncoder::dispatch(const MTLSize &threadGrou
                                                        const MTLSize &threadsPerGroup)
 {
     [get() dispatchThreadgroups:threadGroupsPerGrid threadsPerThreadgroup:threadsPerGroup];
+    return *this;
+}
+
+ComputeCommandEncoder &ComputeCommandEncoder::dispatchIndirect(const BufferRef &indirectBuffer,
+                                                               size_t indirectBufferOffset,
+                                                               const MTLSize &threadsPerGroup)
+{
+    cmdBuffer().setReadDependency(indirectBuffer, /*isRenderCommand=*/false);
+    [get() dispatchThreadgroupsWithIndirectBuffer:indirectBuffer->get()
+                             indirectBufferOffset:indirectBufferOffset
+                            threadsPerThreadgroup:threadsPerGroup];
     return *this;
 }
 

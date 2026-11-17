@@ -87,11 +87,14 @@ std::shared_ptr<ShaderTranslateTask> ShaderMtl::compile(const gl::Context *conte
 
     options->removeInactiveVariables = true;
     options->retainInactiveFragmentOutputs = true;
+    options->emulateR32fImageAtomicExchange =
+        displayMtl->getNativeExtensions().shaderImageAtomicOES;
 
     // Constants:
     options->metal.driverUniformsBindingIndex    = mtl::kDriverUniformsBindingIndex;
     options->metal.defaultUniformsBindingIndex   = mtl::kDefaultUniformsBindingIndex;
     options->metal.UBOArgumentBufferBindingIndex = mtl::kUBOArgumentBufferBindingIndex;
+    options->metal.SSBOArgumentBufferBindingIndex = mtl::kSSBOArgumentBufferBindingIndex;
 
     options->metal.allowSamplerCompareGradient =
         displayMtl->getFeatures().allowSamplerCompareGradient.enabled;

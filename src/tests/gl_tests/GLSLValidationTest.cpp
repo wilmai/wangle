@@ -1982,20 +1982,17 @@ void main()
 
     // Using more than GL_MAX_COMPUTE_SHARED_MEMORY_SIZE split between multiple |shared| variables
     // is not ok.
-    // This validation is not correctly implemented in the AST path.
-    if (getEGLWindow()->isFeatureEnabled(Feature::UseIr))
-    {
-        const GLint maxSharedUintCount     = maxComputeSharedMemorySize / sizeof(uint32_t);
-        const GLint halfMaxSharedUintCount = maxSharedUintCount / 2;
+    const GLint maxSharedUintCount     = maxComputeSharedMemorySize / sizeof(uint32_t);
+    const GLint halfMaxSharedUintCount = maxSharedUintCount / 2;
 
-        std::ostringstream cs;
-        cs << R"(#version 310 es
+    std::ostringstream cs;
+    cs << R"(#version 310 es
 layout (local_size_x = 1) in;
 layout (r32ui, binding = 0) writeonly uniform highp uimage2D img;
 shared uint temp1[)"
-           << halfMaxSharedUintCount << R"(];
+       << halfMaxSharedUintCount << R"(];
 shared uint temp2[)"
-           << (maxSharedUintCount - halfMaxSharedUintCount) << R"(];
+       << (maxSharedUintCount - halfMaxSharedUintCount) << R"(];
 shared uint temp3;
 void main()
 {
@@ -2005,9 +2002,8 @@ void main()
     imageStore(img, ivec2(0), uvec4(temp1[gl_LocalInvocationID.x + 1u] + temp2[gl_LocalInvocationID.x + 1u] + temp3));
 })";
 
-        validateError(GL_COMPUTE_SHADER, cs.str().c_str(),
-                      "Shared memory size exceeds GL_MAX_COMPUTE_SHARED_MEMORY_SIZE");
-    }
+    validateError(GL_COMPUTE_SHADER, cs.str().c_str(),
+                  "Shared memory size exceeds GL_MAX_COMPUTE_SHARED_MEMORY_SIZE");
 }
 
 // Multiple work group layout qualifiers with differing values.

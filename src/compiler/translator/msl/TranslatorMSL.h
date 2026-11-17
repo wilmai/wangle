@@ -9,6 +9,8 @@
 
 #include "compiler/translator/Compiler.h"
 
+#include <vector>
+
 namespace sh
 {
 
@@ -23,7 +25,13 @@ class TranslatorMetalReflection;
 typedef std::unordered_map<size_t, std::string> originalNamesMap;
 typedef std::unordered_map<std::string, size_t> samplerBindingMap;
 typedef std::unordered_map<std::string, size_t> textureBindingMap;
-typedef std::unordered_map<int, int> rwTextureBindingMap;  // GLSL image -> mtl read_write texture.
+struct RWTextureBinding
+{
+    int textureBinding;
+    int texture3DBinding;
+};
+typedef std::unordered_map<std::string, std::vector<RWTextureBinding>>
+    rwTextureBindingMap;  // Image uniform name -> Metal read_write texture bindings.
 typedef std::unordered_map<std::string, size_t> userUniformBufferBindingMap;
 typedef std::pair<size_t, size_t> uboBindingInfo;
 struct UBOBindingInfo
@@ -32,6 +40,7 @@ struct UBOBindingInfo
     size_t arraySize = 0;
 };
 typedef std::unordered_map<std::string, UBOBindingInfo> uniformBufferBindingMap;
+typedef std::unordered_map<std::string, UBOBindingInfo> storageBufferBindingMap;
 
 namespace mtl
 {
@@ -41,7 +50,7 @@ TranslatorMetalReflection *getTranslatorMetalReflection(const TCompiler *compile
 class TranslatorMetalReflection
 {
   public:
-    TranslatorMetalReflection() : hasUBOs(false), hasFlatInput(false) {}
+    TranslatorMetalReflection() : hasUBOs(false), hasSSBOs(false), hasFlatInput(false) {}
     ~TranslatorMetalReflection() {}
 
     void addOriginalName(const size_t id, const std::string &name)
@@ -56,18 +65,29 @@ class TranslatorMetalReflection
     {
         textureBindings.insert({name, textureBinding});
     }
-    void addRWTextureBinding(int glslImageBinding, int mtlRWTextureBinding)
+    void addRWTextureBinding(const std::string &imageName,
+                             uint32_t arrayElement,
+                             int mtlRWTextureBinding)
     {
-        bool inserted = rwTextureBindings.insert({glslImageBinding, mtlRWTextureBinding}).second;
-        if (!inserted)
+        std::vector<RWTextureBinding> &bindings = rwTextureBindings[imageName];
+        if (bindings.size() <= arrayElement)
         {
-            // Shader images are currently only implemented enough to support pixel local storage,
-            // which does not allow more than one image to be bound to the same index.
-            //
-            // NOTE: Pixel local storage also does not allow image bindings to change via
-            // glUniform1i, which we do not currently account for in this backend.
-            UNIMPLEMENTED();
+            bindings.resize(arrayElement + 1, {-1, -1});
         }
+        bindings[arrayElement].textureBinding = mtlRWTextureBinding;
+    }
+    void addRWTexture3DBinding(const std::string &imageName,
+                               uint32_t arrayElement,
+                               int mtlRWTextureBinding)
+    {
+        auto it = rwTextureBindings.find(imageName);
+        ASSERT(it != rwTextureBindings.end() && it->second.size() > arrayElement);
+        if (it == rwTextureBindings.end() || it->second.size() <= arrayElement)
+        {
+            return;
+        }
+        ASSERT(it->second[arrayElement].texture3DBinding < 0);
+        it->second[arrayElement].texture3DBinding = mtlRWTextureBinding;
     }
     void addUserUniformBufferBinding(const std::string &name, size_t userUniformBufferBinding)
     {
@@ -77,6 +97,10 @@ class TranslatorMetalReflection
     {
         uniformBufferBindings.insert({name, bindingInfo});
     }
+    void addStorageBufferBinding(const std::string &name, UBOBindingInfo bindingInfo)
+    {
+        storageBufferBindings.insert({name, bindingInfo});
+    }
     std::string getOriginalName(const size_t id) { return originalNames.at(id); }
     samplerBindingMap getSamplerBindings() const { return samplerBindings; }
     textureBindingMap getTextureBindings() const { return textureBindings; }
@@ -85,6 +109,7 @@ class TranslatorMetalReflection
         return userUniformBufferBindings;
     }
     uniformBufferBindingMap getUniformBufferBindings() const { return uniformBufferBindings; }
+    storageBufferBindingMap getStorageBufferBindings() const { return storageBufferBindings; }
     size_t getSamplerBinding(const std::string &name) const
     {
         auto it = samplerBindings.find(name);
@@ -109,16 +134,11 @@ class TranslatorMetalReflection
         ASSERT(0);
         return std::numeric_limits<size_t>::max();
     }
-    int getRWTextureBinding(int glslImageBinding) const
+    const std::vector<RWTextureBinding> &getRWTextureBindings(const std::string &imageName) const
     {
-        auto it = rwTextureBindings.find(glslImageBinding);
-        if (it != rwTextureBindings.end())
-        {
-            return it->second;
-        }
-        // If there isn't a shader image bound to this slot, return -1. This signals to the program
-        // that there is nothing here to bind.
-        return -1;
+        auto it = rwTextureBindings.find(imageName);
+        static const std::vector<RWTextureBinding> kNoBindings;
+        return it != rwTextureBindings.end() ? it->second : kNoBindings;
     }
     size_t getUserUniformBufferBinding(const std::string &name) const
     {
@@ -148,6 +168,7 @@ class TranslatorMetalReflection
     void reset()
     {
         hasUBOs              = false;
+        hasSSBOs             = false;
         hasFlatInput         = false;
         hasInvariance        = false;
         hasIsnanOrIsinf      = false;
@@ -158,9 +179,11 @@ class TranslatorMetalReflection
         rwTextureBindings.clear();
         userUniformBufferBindings.clear();
         uniformBufferBindings.clear();
+        storageBufferBindings.clear();
     }
 
     bool hasUBOs              = false;
+    bool hasSSBOs             = false;
     bool hasFlatInput         = false;
     bool hasInvariance        = false;
     bool hasIsnanOrIsinf      = false;
@@ -173,6 +196,7 @@ class TranslatorMetalReflection
     rwTextureBindingMap rwTextureBindings;
     userUniformBufferBindingMap userUniformBufferBindings;
     uniformBufferBindingMap uniformBufferBindings;
+    storageBufferBindingMap storageBufferBindings;
 };
 
 class TranslatorMSL : public TCompiler

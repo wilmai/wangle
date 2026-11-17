@@ -194,6 +194,8 @@ class TStructure : public TSymbol, public TFieldListCollection
     // information is used to disambiguate the prefix.
     void setImplementingInterfaceBlock() { mImplementingInterfaceBlock = true; }
     bool isImplementingInterfaceBlock() const { return mImplementingInterfaceBlock; }
+    void setImplementingShaderStorageBlock() { mImplementingShaderStorageBlock = true; }
+    bool isImplementingShaderStorageBlock() const { return mImplementingShaderStorageBlock; }
 
   private:
     friend class TSymbolTable;
@@ -209,7 +211,8 @@ class TStructure : public TSymbol, public TFieldListCollection
                   SymbolClass::Struct),
           TFieldListCollection(fields),
           mAtGlobalScope(true),
-          mImplementingInterfaceBlock(false)
+          mImplementingInterfaceBlock(false),
+          mImplementingShaderStorageBlock(false)
     {}
 
     template <size_t ExtensionCount>
@@ -220,11 +223,13 @@ class TStructure : public TSymbol, public TFieldListCollection
         : TSymbol(id, name, SymbolType::BuiltIn, extensions, SymbolClass::Struct),
           TFieldListCollection(fields),
           mAtGlobalScope(true),
-          mImplementingInterfaceBlock(false)
+          mImplementingInterfaceBlock(false),
+          mImplementingShaderStorageBlock(false)
     {}
 
     bool mAtGlobalScope;
     bool mImplementingInterfaceBlock;
+    bool mImplementingShaderStorageBlock;
 };
 
 // Interface block. Note that this contains the block name, not the instance name. Interface block

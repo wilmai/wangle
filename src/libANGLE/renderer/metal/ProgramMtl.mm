@@ -202,6 +202,7 @@ void ProgramShaderObjVariantMtl::reset(ContextMtl *contextMtl)
     metalShader = nil;
 
     uboArgBufferEncoder.reset(contextMtl);
+    ssboArgBufferEncoder.reset(contextMtl);
 
     translatedSrcInfo = nullptr;
 }
@@ -247,7 +248,7 @@ void ProgramMtl::setBinaryRetrievableHint(bool retrievable) {}
 
 void ProgramMtl::setSeparable(bool separable)
 {
-    UNIMPLEMENTED();
+    // MSL compilation already produces independent shader-stage functions.
 }
 
 void ProgramMtl::prepareForLink(const gl::ShaderMap<ShaderImpl *> &shaders)
@@ -313,6 +314,10 @@ angle::Result ProgramMtl::compileMslShaderLibs(
     {
         mtl::TranslatedShaderInfo *translateInfo =
             &executableMtl->mMslShaderTranslateInfo[shaderType];
+        if (!translateInfo->metalShaderSource || translateInfo->metalShaderSource->empty())
+        {
+            continue;
+        }
         std::map<std::string, std::string> macros = GetDefaultSubstitutionDictionary();
         const bool disableFastMath                = translateInfo->hasIsnanOrIsinf;
         const bool usesInvariance = translateInfo->hasInvariant;
@@ -330,6 +335,37 @@ angle::Result ProgramMtl::compileMslShaderLibs(
             else
             {
                 ANGLE_TRY(CreateMslShaderLib(context, infoLog, translateInfo, macros));
+            }
+        }
+    }
+
+    // Compute programs have no vertex/fragment shader pair, so they are intentionally compiled
+    // outside the GLES 2 shader-type loop above.
+    {
+        constexpr gl::ShaderType shaderType = gl::ShaderType::Compute;
+        mtl::TranslatedShaderInfo *translateInfo =
+            &executableMtl->mMslShaderTranslateInfo[shaderType];
+        if (translateInfo->metalShaderSource && !translateInfo->metalShaderSource->empty())
+        {
+            std::map<std::string, std::string> macros = GetDefaultSubstitutionDictionary();
+            const bool disableFastMath                = translateInfo->hasIsnanOrIsinf;
+            const bool usesInvariance                 = translateInfo->hasInvariant;
+
+            translateInfo->metalLibrary =
+                libraryCache.get(translateInfo->metalShaderSource, macros, disableFastMath,
+                                 usesInvariance);
+
+            if (!translateInfo->metalLibrary)
+            {
+                if (asyncCompile)
+                {
+                    subTasksOut->emplace_back(new CompileMslTask(displayMtl, translateInfo,
+                                                                  macros));
+                }
+                else
+                {
+                    ANGLE_TRY(CreateMslShaderLib(context, infoLog, translateInfo, macros));
+                }
             }
         }
     }

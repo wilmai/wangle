@@ -8,6 +8,8 @@
 
 // C++ string version of combined Metal default shaders.
 
+
+
 static char gDefaultMetallibSrc[] = R"(
 # include <simd/simd.h>
 # include <metal_stdlib>
@@ -1454,7 +1456,7 @@ static inline int4 readR10G10B10A2_SINT(uint bufferOffset, const device uchar *b
     int3 isRgbNegative = (color.rgb & rgbSignMask) >> 9;
     color.rgb = (isRgbNegative * negativeMask) | color.rgb;
     color.a = getShiftedData<2, 30>(src);
-    int isAlphaNegative = color.a & alphaSignMask >> 1;
+    int isAlphaNegative = (color.a & alphaSignMask) >> 1;
     color.a = (isAlphaNegative * alphaNegMask) | color.a;
     return color;
 }

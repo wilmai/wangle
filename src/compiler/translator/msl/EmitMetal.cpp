@@ -4,8 +4,11 @@
 // found in the LICENSE file.
 //
 
+#include <algorithm>
 #include <cctype>
 #include <map>
+#include <string>
+#include <unordered_set>
 
 #include "common/system_utils.h"
 #include "common/unsafe_buffers.h"
@@ -75,6 +78,239 @@ struct VarDecl
     bool mIsField;
 };
 
+constexpr AddressSpace kThreadgroupAddressSpace = AddressSpace::Threadgroup;
+// Reserve one range for all sampler and image bindings before placing the extra 3D texture views
+// used to emulate 2D images backed by 3D textures.
+constexpr size_t kMetalImage3DBindingOffset = 24;  // 8 image units + 16 sampler units.
+
+Layout GetGlslStorageBufferLayoutOf(const TType &type,
+                                    TLayoutBlockStorage storage,
+                                    TLayoutMatrixPacking packing);
+
+bool GetStorageBufferArrayWrapperStride(
+    const TType &type,
+    size_t *strideOut,
+    TLayoutBlockStorage inheritedStorage = TLayoutBlockStorage::EbsStd430)
+{
+    if (!type.isArray() || type.getNumArraySizes() != 1 || type.isUnsizedArray())
+    {
+        return false;
+    }
+
+    TType elementType(type);
+    elementType.toArrayElementType();
+    if (!(elementType.isScalar() || elementType.isVector()) ||
+        (elementType.getBasicType() != TBasicType::EbtFloat &&
+         elementType.getBasicType() != TBasicType::EbtInt &&
+         elementType.getBasicType() != TBasicType::EbtUInt))
+    {
+        return false;
+    }
+
+    const TLayoutBlockStorage storage = Overlay(inheritedStorage, type);
+    const Layout glslArray =
+        GetGlslStorageBufferLayoutOf(type, storage, TLayoutMatrixPacking::EmpColumnMajor);
+    const size_t glslStride = glslArray.sizeOf / type.getOutermostArraySize();
+    const size_t metalSize  = MetalLayoutOf(elementType).sizeOf;
+    if (glslStride <= metalSize)
+    {
+        return false;
+    }
+
+    *strideOut = glslStride;
+    return true;
+}
+
+std::string GetStorageBufferArrayWrapperName(const TStructure &parent,
+                                             const TField &field,
+                                             TLayoutBlockStorage storage)
+{
+    return "ANGLE_SSBO_array_" + std::to_string(parent.uniqueId().get()) + "_" +
+           field.name().data() + "_" + std::to_string(static_cast<int>(storage));
+}
+
+bool IsStorageBufferMatrixField(const TType &type)
+{
+    TType baseType(type);
+    baseType.toArrayBaseType();
+    return baseType.isMatrix();
+}
+
+std::string GetStorageBufferMatrixWrapperName(const TStructure &parent, const TField &field)
+{
+    return "ANGLE_SSBO_matrix_" + std::to_string(parent.uniqueId().get()) + "_" +
+           field.name().data();
+}
+
+void GetStorageBufferMatrixLayout(const TType &matrixType,
+                                  size_t *majorCountOut,
+                                  size_t *vectorSizeOut,
+                                  size_t *vectorStrideOut,
+                                  bool *isRowMajorOut)
+{
+    const TLayoutBlockStorage storage  = Overlay(TLayoutBlockStorage::EbsStd430, matrixType);
+    const TLayoutMatrixPacking packing = Overlay(TLayoutMatrixPacking::EmpColumnMajor, matrixType);
+    const bool isRowMajor              = packing == TLayoutMatrixPacking::EmpRowMajor;
+    const size_t majorCount            = isRowMajor ? matrixType.getRows() : matrixType.getCols();
+    const size_t vectorSize            = isRowMajor ? matrixType.getCols() : matrixType.getRows();
+    const Layout vectorLayout =
+        GetGlslStorageBufferLayoutOf(TType(TBasicType::EbtFloat, static_cast<uint8_t>(vectorSize)),
+                                     storage, TLayoutMatrixPacking::EmpColumnMajor);
+    size_t vectorAlignment = vectorLayout.alignOf;
+    if (storage == TLayoutBlockStorage::EbsStd140 || storage == TLayoutBlockStorage::EbsShared)
+    {
+        vectorAlignment = std::max<size_t>(vectorAlignment, 16);
+    }
+    const size_t vectorStride =
+        ((vectorLayout.sizeOf + vectorAlignment - 1) / vectorAlignment) * vectorAlignment;
+    *majorCountOut   = majorCount;
+    *vectorSizeOut   = vectorSize;
+    *vectorStrideOut = vectorStride;
+    *isRowMajorOut   = isRowMajor;
+}
+
+size_t RoundUpToStorageAlignment(size_t size, size_t alignment)
+{
+    return alignment == 0 ? size : ((size + alignment - 1) / alignment) * alignment;
+}
+
+Layout GetGlslStorageBufferLayoutOf(const TType &type,
+                                    TLayoutBlockStorage storage,
+                                    TLayoutMatrixPacking packing)
+{
+    storage = Overlay(storage, type);
+    packing = Overlay(packing, type);
+
+    if (type.isArray())
+    {
+        TType elementType(type);
+        elementType.toArrayElementType();
+        Layout elementLayout  = GetGlslStorageBufferLayoutOf(elementType, storage, packing);
+        size_t arrayAlignment = elementLayout.alignOf;
+        if (storage == TLayoutBlockStorage::EbsStd140 || storage == TLayoutBlockStorage::EbsShared)
+        {
+            arrayAlignment = std::max<size_t>(arrayAlignment, 16);
+        }
+        const size_t stride = RoundUpToStorageAlignment(elementLayout.sizeOf, arrayAlignment);
+        return {stride * type.getOutermostArraySize(), arrayAlignment};
+    }
+
+    if (const TStructure *structure = type.getStruct())
+    {
+        size_t offset    = 0;
+        size_t alignment = 1;
+        for (const TField *field : structure->fields())
+        {
+            const Layout fieldLayout =
+                GetGlslStorageBufferLayoutOf(*field->type(), storage, packing);
+            offset = RoundUpToStorageAlignment(offset, fieldLayout.alignOf);
+            offset += fieldLayout.sizeOf;
+            alignment = std::max(alignment, fieldLayout.alignOf);
+        }
+        if (storage == TLayoutBlockStorage::EbsStd140 || storage == TLayoutBlockStorage::EbsShared)
+        {
+            alignment = std::max<size_t>(alignment, 16);
+        }
+        return {RoundUpToStorageAlignment(offset, alignment), alignment};
+    }
+
+    if (type.isMatrix())
+    {
+        size_t majorCount;
+        size_t vectorSize;
+        size_t vectorStride;
+        bool isRowMajor;
+        GetStorageBufferMatrixLayout(type, &majorCount, &vectorSize, &vectorStride, &isRowMajor);
+        ASSERT(vectorSize == (isRowMajor ? type.getCols() : type.getRows()));
+        return {majorCount * vectorStride, vectorStride};
+    }
+
+    if (type.isVector())
+    {
+        const size_t vectorSize    = type.getNominalSize();
+        const size_t componentSize = type.getBasicType() == TBasicType::EbtBool ? 4 : 4;
+        const size_t alignment     = vectorSize == 1   ? componentSize
+                                     : vectorSize == 2 ? componentSize * 2
+                                                       : componentSize * 4;
+        return {componentSize * vectorSize, alignment};
+    }
+
+    return {4, 4};
+}
+
+bool NeedsStorageBufferMatrixWrapper(const TType &type)
+{
+    if (!IsStorageBufferMatrixField(type))
+    {
+        return false;
+    }
+
+    TType matrixType(type);
+    matrixType.toArrayBaseType();
+    size_t majorCount;
+    size_t vectorSize;
+    size_t vectorStride;
+    bool isRowMajor;
+    GetStorageBufferMatrixLayout(matrixType, &majorCount, &vectorSize, &vectorStride, &isRowMajor);
+    if (isRowMajor)
+    {
+        return true;
+    }
+    return majorCount * vectorStride != MetalLayoutOf(matrixType).sizeOf;
+}
+
+bool NeedsStorageBufferStructVariant(const TStructure &structure,
+                                     TLayoutBlockStorage storage,
+                                     TLayoutMatrixPacking packing)
+{
+    size_t glslOffset          = 0;
+    size_t metalOffset         = 0;
+    size_t glslAlignment       = 1;
+    size_t metalAlignment      = 1;
+    bool needsNestedConversion = false;
+
+    for (const TField *field : structure.fields())
+    {
+        const TType &fieldType                  = *field->type();
+        const TLayoutBlockStorage fieldStorage  = Overlay(storage, fieldType);
+        const TLayoutMatrixPacking fieldPacking = Overlay(packing, fieldType);
+        const Layout glslFieldLayout =
+            GetGlslStorageBufferLayoutOf(fieldType, fieldStorage, fieldPacking);
+        const Layout metalFieldLayout = MetalLayoutOf(fieldType);
+
+        glslOffset  = RoundUpToStorageAlignment(glslOffset, glslFieldLayout.alignOf);
+        metalOffset = RoundUpToStorageAlignment(metalOffset, metalFieldLayout.alignOf);
+        if (glslOffset != metalOffset)
+        {
+            return true;
+        }
+        glslOffset += glslFieldLayout.sizeOf;
+        metalOffset += metalFieldLayout.sizeOf;
+        glslAlignment  = std::max(glslAlignment, glslFieldLayout.alignOf);
+        metalAlignment = std::max(metalAlignment, metalFieldLayout.alignOf);
+
+        TType baseType(fieldType);
+        baseType.toArrayBaseType();
+        if (const TStructure *nested = baseType.getStruct())
+        {
+            needsNestedConversion |=
+                NeedsStorageBufferStructVariant(*nested, fieldStorage, fieldPacking);
+        }
+        if (IsStorageBufferMatrixField(fieldType) && NeedsStorageBufferMatrixWrapper(fieldType))
+        {
+            needsNestedConversion = true;
+        }
+    }
+
+    if (storage == TLayoutBlockStorage::EbsStd140 || storage == TLayoutBlockStorage::EbsShared)
+    {
+        glslAlignment = std::max<size_t>(glslAlignment, 16);
+    }
+    const size_t glslSize  = RoundUpToStorageAlignment(glslOffset, glslAlignment);
+    const size_t metalSize = RoundUpToStorageAlignment(metalOffset, metalAlignment);
+    return needsNestedConversion || glslSize != metalSize || glslAlignment != metalAlignment;
+}
+
 class GenMetalTraverser : public TIntermTraverser
 {
   public:
@@ -115,14 +351,15 @@ class GenMetalTraverser : public TIntermTraverser
 
     struct EmitVariableDeclarationConfig
     {
-        bool isParameter                = false;
-        bool isMainParameter            = false;
-        bool emitPostQualifier          = false;
-        bool isPacked                   = false;
-        bool disableStructSpecifier     = false;
-        bool isUBO                      = false;
-        const AddressSpace *isPointer   = nullptr;
-        const AddressSpace *isReference = nullptr;
+        bool isParameter                        = false;
+        bool isMainParameter                    = false;
+        bool emitPostQualifier                  = false;
+        bool isPacked                           = false;
+        bool disableStructSpecifier             = false;
+        bool isUBO                              = false;
+        const AddressSpace *isPointer           = nullptr;
+        const AddressSpace *isReference         = nullptr;
+        const AddressSpace *storageAddressSpace = nullptr;
     };
 
     struct EmitTypeConfig
@@ -136,6 +373,17 @@ class GenMetalTraverser : public TIntermTraverser
     void emitFunctionSignature(const TFunction &func);
     void emitFunctionReturn(const TFunction &func);
     void emitFunctionParameter(const TFunction &func, const TVariable &param);
+    void emitStorageBufferMatrixHelpers();
+    void emitStorageBufferArrayWrapper(const TStructure &parent,
+                                       const TField &field,
+                                       TLayoutBlockStorage storage);
+    std::string getStorageBufferStructVariantName(const TStructure &structure,
+                                                  TLayoutBlockStorage storage,
+                                                  TLayoutMatrixPacking packing) const;
+    void emitStorageBufferStructVariant(const TStructure &structure,
+                                        TLayoutBlockStorage storage,
+                                        TLayoutMatrixPacking packing);
+    void emitStorageBufferPadding(size_t byteCount, size_t padIndex);
 
     void emitNameOf(const TField &object);
     void emitNameOf(const TSymbol &object);
@@ -163,6 +411,10 @@ class GenMetalTraverser : public TIntermTraverser
     void emitAttributeDeclaration(const TField &field, FieldAnnotationIndices &annotationIndices);
     void emitUniformBufferDeclaration(const TField &field,
                                       FieldAnnotationIndices &annotationIndices);
+    void emitStorageBufferDeclaration(const TField &field,
+                                      FieldAnnotationIndices &annotationIndices);
+    void emitStorageBufferLengthDeclaration(const TField &field,
+                                            FieldAnnotationIndices &annotationIndices);
     void emitStructDeclaration(const TType &type);
     void emitOrdinaryVariableDeclaration(const VarDecl &decl,
                                          const EmitVariableDeclarationConfig &evdConfig);
@@ -177,6 +429,9 @@ class GenMetalTraverser : public TIntermTraverser
     const TField &getDirectField(const TFieldListCollection &fieldsNode,
                                  const TConstantUnion &index);
     const TField &getDirectField(const TIntermTyped &fieldsNode, TIntermTyped &indexNode);
+    const TField *getStorageBufferField(TIntermTyped &expression,
+                                        const TStructure **parentOut = nullptr);
+    const TField *getStorageBufferArrayField(TIntermTyped &expression);
 
     const TConstantUnion *emitConstantUnionArray(const TConstantUnion *const constUnion,
                                                  const size_t size);
@@ -197,17 +452,96 @@ class GenMetalTraverser : public TIntermTraverser
     int mOpenPointerParenCount        = 0;
     bool mParentIsSwitch              = false;
     bool isTraversingVertexMain       = false;
+    bool mIsComputeMain               = false;
+    bool mInjectSharedVariables       = false;
     bool mTemporarilyDisableSemicolon = false;
+    std::vector<const TVariable *> mSharedVariables;
     std::unordered_map<const TSymbol *, Name> mRenamedSymbols;
-    const FuncToName mFuncToName           = BuildFuncToName();
-    size_t mMainTextureIndex               = 0;
-    size_t mMainSamplerIndex               = 0;
-    size_t mMainUniformBufferIndex         = 0;
-    size_t mDriverUniformsBindingIndex     = 0;
-    size_t mUBOArgumentBufferBindingIndex  = 0;
-    bool mRasterOrderGroupsSupported       = false;
-    bool mWriteHelperSampleMask            = false;
+    const FuncToName mFuncToName            = BuildFuncToName();
+    size_t mMainTextureIndex                = 0;
+    size_t mMainSamplerIndex                = 0;
+    size_t mMainUniformBufferIndex          = 0;
+    size_t mDriverUniformsBindingIndex      = 0;
+    size_t mUBOArgumentBufferBindingIndex   = 0;
+    size_t mSSBOArgumentBufferBindingIndex  = 0;
+    bool mRasterOrderGroupsSupported        = false;
+    bool mWriteHelperSampleMask             = false;
+    bool mSuppressStorageBufferMatrixLoad   = false;
+    bool mStorageBufferMatrixHelpersEmitted = false;
+    std::vector<std::pair<const TStructure *, const TField *>> mStorageBufferMatrixFields;
+    std::unordered_set<std::string> mEmittedStorageBufferArrayWrappers;
+    std::unordered_set<std::string> mEmittedStorageBufferStructVariants;
 };
+
+bool IsImage2DType(TBasicType type)
+{
+    return type == EbtImage2D || type == EbtIImage2D || type == EbtUImage2D;
+}
+
+bool IsImageCubeType(TBasicType type)
+{
+    return type == EbtImageCube || type == EbtIImageCube || type == EbtUImageCube;
+}
+
+const char *GetImageAtomicFunctionName(TOperator op)
+{
+    switch (op)
+    {
+        case TOperator::EOpImageAtomicAdd:
+            return "ANGLE_imageAtomicAdd";
+        case TOperator::EOpImageAtomicMin:
+            return "ANGLE_imageAtomicMin";
+        case TOperator::EOpImageAtomicMax:
+            return "ANGLE_imageAtomicMax";
+        case TOperator::EOpImageAtomicAnd:
+            return "ANGLE_imageAtomicAnd";
+        case TOperator::EOpImageAtomicOr:
+            return "ANGLE_imageAtomicOr";
+        case TOperator::EOpImageAtomicXor:
+            return "ANGLE_imageAtomicXor";
+        case TOperator::EOpImageAtomicExchange:
+            return "ANGLE_imageAtomicExchange";
+        case TOperator::EOpImageAtomicCompSwap:
+            return "ANGLE_imageAtomicCompSwap";
+        default:
+            UNREACHABLE();
+            return "";
+    }
+}
+
+TBasicType GetImage3DType(TBasicType type)
+{
+    switch (type)
+    {
+        case EbtImage2D:
+            return EbtImage3D;
+        case EbtIImage2D:
+            return EbtIImage3D;
+        case EbtUImage2D:
+            return EbtUImage3D;
+        default:
+            UNREACHABLE();
+            return EbtImage3D;
+    }
+}
+
+void EmitMetalArrayTypePrefix(Sink &out, const angle::Span<const unsigned int> &arraySizes)
+{
+    for (size_t index = arraySizes.size(); index > 0; --index)
+    {
+        out << "metal::array<";
+    }
+}
+
+void EmitMetalArrayTypeSuffix(Sink &out,
+                              const angle::Span<const unsigned int> &arraySizes,
+                              bool emitUnsizedArrayAsOne = false)
+{
+    for (unsigned int size : arraySizes)
+    {
+        out << ", " << (emitUnsizedArrayAsOne && size == 0 ? 1 : size) << ">";
+    }
+}
 }  // anonymous namespace
 
 GenMetalTraverser::~GenMetalTraverser()
@@ -234,6 +568,7 @@ GenMetalTraverser::GenMetalTraverser(const TCompiler &compiler,
       mMainUniformBufferIndex(compileOptions.metal.defaultUniformsBindingIndex),
       mDriverUniformsBindingIndex(compileOptions.metal.driverUniformsBindingIndex),
       mUBOArgumentBufferBindingIndex(compileOptions.metal.UBOArgumentBufferBindingIndex),
+      mSSBOArgumentBufferBindingIndex(compileOptions.metal.SSBOArgumentBufferBindingIndex),
       mRasterOrderGroupsSupported(compileOptions.pls.fragmentSyncType ==
                                   ShFragmentSynchronizationType::RasterOrderGroups_Metal),
       mWriteHelperSampleMask(ppc.writeHelperSampleMask)
@@ -558,7 +893,7 @@ static const char *GetOperatorString(TOperator op,
         case TOperator::EOpLdexp:
             return "metal::ldexp";
         case TOperator::EOpFrexp:
-            return "metal::frexp";
+            return "ANGLE_frexp";
         case TOperator::EOpInversesqrt:
             return "metal::rsqrt";
         case TOperator::EOpCross:
@@ -682,35 +1017,58 @@ static const char *GetOperatorString(TOperator op,
         case TOperator::EOpSamplePosition:
             return "metal::get_sample_position";
 
-        case TOperator::EOpBitfieldExtract:
-        case TOperator::EOpBitfieldInsert:
-        case TOperator::EOpBitfieldReverse:
-        case TOperator::EOpBitCount:
-        case TOperator::EOpFindLSB:
-        case TOperator::EOpFindMSB:
         case TOperator::EOpUaddCarry:
+            return "ANGLE_uaddCarry";
         case TOperator::EOpUsubBorrow:
+            return "ANGLE_usubBorrow";
         case TOperator::EOpUmulExtended:
+            return "ANGLE_umulExtended";
         case TOperator::EOpImulExtended:
+            return "ANGLE_imulExtended";
+        case TOperator::EOpBitfieldExtract:
+            return "metal::extract_bits";
+        case TOperator::EOpBitfieldInsert:
+            return "metal::insert_bits";
+        case TOperator::EOpBitfieldReverse:
+            return "metal::reverse_bits";
+        case TOperator::EOpBitCount:
+            return "ANGLE_bitCount";
+        case TOperator::EOpFindLSB:
+            return "ANGLE_findLSB";
+        case TOperator::EOpFindMSB:
+            return "ANGLE_findMSB";
         case TOperator::EOpBarrier:
+            return "ANGLE_barrier";
         case TOperator::EOpMemoryBarrier:
         case TOperator::EOpMemoryBarrierAtomicCounter:
         case TOperator::EOpMemoryBarrierBuffer:
         case TOperator::EOpMemoryBarrierShared:
         case TOperator::EOpGroupMemoryBarrier:
+            return "ANGLE_memoryBarrier";
         case TOperator::EOpAtomicAdd:
+            return "metal::atomic_fetch_add_explicit";
         case TOperator::EOpAtomicMin:
+            return "metal::atomic_fetch_min_explicit";
         case TOperator::EOpAtomicMax:
+            return "metal::atomic_fetch_max_explicit";
         case TOperator::EOpAtomicAnd:
+            return "metal::atomic_fetch_and_explicit";
         case TOperator::EOpAtomicOr:
+            return "metal::atomic_fetch_or_explicit";
         case TOperator::EOpAtomicXor:
+            return "metal::atomic_fetch_xor_explicit";
         case TOperator::EOpAtomicExchange:
+            return "metal::atomic_exchange_explicit";
         case TOperator::EOpAtomicCompSwap:
+            return "ANGLE_atomicCompSwap";
         case TOperator::EOpEmitVertex:
         case TOperator::EOpEndPrimitive:
-        case TOperator::EOpArrayLength:
             UNIMPLEMENTED();
             return "TOperator_TODO";
+
+        case TOperator::EOpArrayLength:
+            // SSBO runtime-array length is emitted directly by visitUnary().
+            return nullptr;
 
         case TOperator::EOpNull:
         case TOperator::EOpConstruct:
@@ -1040,27 +1398,107 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
             }
             else if (IsImage(basicType))
             {
-                mOut << "metal::texture2d<";
+                const char *textureType;
+                const char *componentType;
                 switch (type.getBasicType())
                 {
+                    case EbtImageBuffer:
+                        textureType   = "texture_buffer";
+                        componentType = "float";
+                        break;
+                    case EbtIImageBuffer:
+                        textureType   = "texture_buffer";
+                        componentType = "int";
+                        break;
+                    case EbtUImageBuffer:
+                        textureType   = "texture_buffer";
+                        componentType = "uint";
+                        break;
                     case EbtImage2D:
-                        mOut << "float";
+                        textureType   = "texture2d";
+                        componentType = "float";
                         break;
                     case EbtIImage2D:
-                        mOut << "int";
+                        textureType   = "texture2d";
+                        componentType = "int";
                         break;
                     case EbtUImage2D:
-                        mOut << "uint";
+                        textureType   = "texture2d";
+                        componentType = "uint";
+                        break;
+                    case EbtImage2DArray:
+                        textureType   = "texture2d_array";
+                        componentType = "float";
+                        break;
+                    case EbtIImage2DArray:
+                        textureType   = "texture2d_array";
+                        componentType = "int";
+                        break;
+                    case EbtUImage2DArray:
+                        textureType   = "texture2d_array";
+                        componentType = "uint";
+                        break;
+                    case EbtImage3D:
+                        textureType   = "texture3d";
+                        componentType = "float";
+                        break;
+                    case EbtIImage3D:
+                        textureType   = "texture3d";
+                        componentType = "int";
+                        break;
+                    case EbtUImage3D:
+                        textureType   = "texture3d";
+                        componentType = "uint";
+                        break;
+                    case EbtImageCube:
+                        textureType   = mCompileOptions.emulateR32fImageAtomicExchange
+                                            ? "texture2d_array"
+                                            : "texturecube";
+                        componentType = "float";
+                        break;
+                    case EbtIImageCube:
+                        textureType   = mCompileOptions.emulateR32fImageAtomicExchange
+                                            ? "texture2d_array"
+                                            : "texturecube";
+                        componentType = "int";
+                        break;
+                    case EbtUImageCube:
+                        textureType   = mCompileOptions.emulateR32fImageAtomicExchange
+                                            ? "texture2d_array"
+                                            : "texturecube";
+                        componentType = "uint";
                         break;
                     default:
                         UNIMPLEMENTED();
+                        textureType   = "texture2d";
+                        componentType = "float";
                         break;
                 }
-                if (type.getMemoryQualifier().readonly || type.getMemoryQualifier().writeonly)
+
+                const char *access = "read_write";
+                if (type.getMemoryQualifier().readonly)
                 {
-                    UNIMPLEMENTED();
+                    access = "read";
                 }
-                mOut << ", metal::access::read_write>";
+                else if (type.getMemoryQualifier().writeonly)
+                {
+                    access = "write";
+                }
+
+                const bool isCoherent = type.getMemoryQualifier().coherent;
+                if (isCoherent)
+                {
+                    // Metal 3.2 defaults textures to threadgroup coherence.  GLSL coherent image
+                    // accesses need visibility across the device when synchronized.
+                    mOut << "/*ANGLE_REQUIRES_MSL_3_2*/";
+                }
+                mOut << "metal::" << textureType << "<" << componentType
+                     << ", metal::access::" << access;
+                if (isCoherent)
+                {
+                    mOut << ", metal::memory_coherence_device";
+                }
+                mOut << ">";
             }
             else
             {
@@ -1073,6 +1511,15 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
 void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConfig)
 {
     const bool isUBO = etConfig.evdConfig ? etConfig.evdConfig->isUBO : false;
+    const bool isRuntimeArrayPointer =
+        etConfig.evdConfig && etConfig.evdConfig->isPointer && type.isUnsizedArray();
+    TType typeToEmit = type;
+    if (isRuntimeArrayPointer)
+    {
+        // Metal represents a GLSL runtime array as a pointer to its element type.  The array
+        // itself has no compile-time size and must not be emitted as metal::array<T, 0>.
+        typeToEmit.toArrayElementType();
+    }
     if (etConfig.evdConfig)
     {
         const auto &evdConfig = *etConfig.evdConfig;
@@ -1080,7 +1527,7 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
         {
             if (type.isArray())
             {
-                mOut << "metal::array<";
+                EmitMetalArrayTypePrefix(mOut, type.getArraySizes());
             }
         }
         if (evdConfig.isPointer)
@@ -1093,13 +1540,18 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
             mOut << toString(*evdConfig.isReference);
             mOut << " ";
         }
+        else if (evdConfig.storageAddressSpace)
+        {
+            mOut << toString(*evdConfig.storageAddressSpace);
+            mOut << " ";
+        }
     }
 
     if (!isUBO)
     {
-        if (type.isArray())
+        if (typeToEmit.isArray())
         {
-            mOut << "metal::array<";
+            EmitMetalArrayTypePrefix(mOut, typeToEmit.getArraySizes());
         }
     }
 
@@ -1118,19 +1570,19 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
         mOut << "packed_";
     }
 
-    emitBareTypeName(type, etConfig);
+    emitBareTypeName(typeToEmit, etConfig);
 
-    if (type.isVector())
+    if (typeToEmit.isVector())
     {
-        mOut << static_cast<uint32_t>(type.getNominalSize());
+        mOut << static_cast<uint32_t>(typeToEmit.getNominalSize());
     }
-    else if (type.isMatrix())
+    else if (typeToEmit.isMatrix())
     {
-        mOut << static_cast<uint32_t>(type.getCols()) << "x"
-             << static_cast<uint32_t>(type.getRows());
+        mOut << static_cast<uint32_t>(typeToEmit.getCols()) << "x"
+             << static_cast<uint32_t>(typeToEmit.getRows());
     }
 
-    if (type.isInterpolant())
+    if (typeToEmit.isInterpolant())
     {
         mOut << ", metal::interpolation::";
         switch (type.getQualifier())
@@ -1148,13 +1600,12 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
 
     if (!isUBO)
     {
-        if (type.isArray())
+        if (typeToEmit.isArray())
         {
-            for (auto size : type.getArraySizes())
-            {
-                mOut << ", " << size;
-            }
-            mOut << ">";
+            // Represent a runtime-sized SSBO member as a one-element trailing array. The array's
+            // GLSL type remains unsized, so visitBinary emits unclamped indexing; this member
+            // provides the correct base offset in the bound Metal buffer.
+            EmitMetalArrayTypeSuffix(mOut, typeToEmit.getArraySizes(), type.isUnsizedArray());
         }
     }
 
@@ -1173,11 +1624,7 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
         {
             if (type.isArray())
             {
-                for (auto size : type.getArraySizes())
-                {
-                    mOut << ", " << size;
-                }
-                mOut << ">";
+                EmitMetalArrayTypeSuffix(mOut, type.getArraySizes());
             }
         }
     }
@@ -1190,22 +1637,197 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
     const TType &type      = *field.type();
     const TBasicType basic = type.getBasicType();
 
+    if (IsImage(basic) && type.isArray())
+    {
+        // MSL texture arrays can be function arguments, but they cannot be members of a regular
+        // structure.  ANGLE passes image resources through a structure, so expand each GLSL image
+        // array element into a separately bound texture member.  visitBinary maps constant GLSL
+        // indexing to these generated members.
+        const uint32_t imageArraySize = static_cast<uint32_t>(type.getArraySizeProduct());
+        TType imageType               = type;
+        imageType.toArrayElementType();
+
+        TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
+        for (uint32_t arrayElement = 0; arrayElement < imageArraySize; ++arrayElement)
+        {
+            if (arrayElement > 0)
+            {
+                mOut << ";\n";
+                emitIndentation();
+            }
+
+            emitType(imageType, {});
+            mOut << " ";
+            emitNameOf(field);
+            mOut << "_ANGLE_image_element_" << arrayElement;
+            mOut << " [[";
+            if (type.getLayoutQualifier().rasterOrdered)
+            {
+                mOut << "raster_order_group(0), ";
+            }
+            mOut << "texture(" << mMainTextureIndex + arrayElement << ")]]";
+            reflection->addRWTextureBinding(field.name().data(), arrayElement,
+                                            static_cast<int>(mMainTextureIndex + arrayElement));
+            if (IsImage2DType(imageType.getBasicType()))
+            {
+                mOut << ";\n";
+                emitIndentation();
+                TType image3DType = imageType;
+                image3DType.setBasicType(GetImage3DType(imageType.getBasicType()));
+                emitType(image3DType, {});
+                mOut << " ";
+                emitNameOf(field);
+                mOut << "_ANGLE_image_element_" << arrayElement << "_ANGLE_3D [[texture("
+                     << mMainTextureIndex + arrayElement + kMetalImage3DBindingOffset << ")]]";
+                reflection->addRWTexture3DBinding(
+                    field.name().data(), arrayElement,
+                    static_cast<int>(mMainTextureIndex + arrayElement +
+                                     kMetalImage3DBindingOffset));
+            }
+        }
+        mMainTextureIndex += imageArraySize;
+        return;
+    }
+
+    if (IsImage2DType(type.getBasicType()))
+    {
+        TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
+        emitType(type, {});
+        mOut << " ";
+        emitNameOf(field);
+        mOut << " [[texture(" << mMainTextureIndex << ")]];\n";
+        emitIndentation();
+
+        TType image3DType = type;
+        image3DType.setBasicType(GetImage3DType(type.getBasicType()));
+        emitType(image3DType, {});
+        mOut << " ";
+        emitNameOf(field);
+        mOut << "_ANGLE_3D [[texture(" << mMainTextureIndex + kMetalImage3DBindingOffset << ")]]";
+        reflection->addRWTextureBinding(field.name().data(), 0,
+                                        static_cast<int>(mMainTextureIndex));
+        reflection->addRWTexture3DBinding(
+            field.name().data(), 0,
+            static_cast<int>(mMainTextureIndex + kMetalImage3DBindingOffset));
+        ++mMainTextureIndex;
+        return;
+    }
+
     EmitVariableDeclarationConfig evdConfig;
     evdConfig.emitPostQualifier      = true;
     evdConfig.disableStructSpecifier = true;
-    evdConfig.isPacked               = mSymbolEnv.isPacked(field);
-    evdConfig.isUBO                  = mSymbolEnv.isUBO(field);
-    evdConfig.isPointer              = mSymbolEnv.isPointer(field);
-    evdConfig.isReference            = mSymbolEnv.isReference(field);
-    emitVariableDeclaration(VarDecl(field), evdConfig);
+    TType baseType(type);
+    baseType.toArrayBaseType();
+    const TStructure *nestedStorageBufferStruct = baseType.getStruct();
+    const bool usesStorageBufferStructVariant =
+        parent.isImplementingShaderStorageBlock() && nestedStorageBufferStruct &&
+        NeedsStorageBufferStructVariant(*nestedStorageBufferStruct,
+                                        Overlay(TLayoutBlockStorage::EbsStd430, type),
+                                        Overlay(TLayoutMatrixPacking::EmpColumnMajor, type));
+    const bool usesStorageBufferMatrixWrapper =
+        parent.isImplementingShaderStorageBlock() && NeedsStorageBufferMatrixWrapper(type);
+    if (usesStorageBufferStructVariant)
+    {
+        const TLayoutBlockStorage storage  = Overlay(TLayoutBlockStorage::EbsStd430, type);
+        const TLayoutMatrixPacking packing = Overlay(TLayoutMatrixPacking::EmpColumnMajor, type);
+        if (type.isArray())
+        {
+            EmitMetalArrayTypePrefix(mOut, type.getArraySizes());
+        }
+        mOut << getStorageBufferStructVariantName(*nestedStorageBufferStruct, storage, packing);
+        if (type.isArray())
+        {
+            EmitMetalArrayTypeSuffix(mOut, type.getArraySizes(), type.isUnsizedArray());
+        }
+        mOut << " ";
+        emitNameOf(field);
+    }
+    else if (usesStorageBufferMatrixWrapper)
+    {
+        if (type.isArray())
+        {
+            EmitMetalArrayTypePrefix(mOut, type.getArraySizes());
+        }
+        mOut << GetStorageBufferMatrixWrapperName(parent, field);
+        if (type.isArray())
+        {
+            EmitMetalArrayTypeSuffix(mOut, type.getArraySizes(), type.isUnsizedArray());
+        }
+        mOut << " ";
+        emitNameOf(field);
+    }
 
-    const TQualifier qual = type.getQualifier();
+    size_t storageBufferArrayStride = 0;
+    const bool usesStorageBufferArrayWrapper =
+        parent.isImplementingShaderStorageBlock() &&
+        GetStorageBufferArrayWrapperStride(type, &storageBufferArrayStride);
+    const bool isStorageBufferVec3 =
+        parent.isImplementingShaderStorageBlock() &&
+        (type.getLayoutQualifier().blockStorage == TLayoutBlockStorage::EbsStd430 ||
+         type.getLayoutQualifier().blockStorage == TLayoutBlockStorage::EbsStd140 ||
+         type.getLayoutQualifier().blockStorage == TLayoutBlockStorage::EbsShared) &&
+        type.isVector() && type.getNominalSize() == 3 && !type.isArray() &&
+        (type.getBasicType() == TBasicType::EbtFloat || type.getBasicType() == TBasicType::EbtInt ||
+         type.getBasicType() == TBasicType::EbtUInt);
+    if (isStorageBufferVec3)
+    {
+        // Metal's three-component vectors occupy 16 bytes.  std430 places a following scalar
+        // after the vec3's 12-byte payload, so use an aligned packed vector in the block struct.
+        mOut << "alignas(16) ";
+    }
+    evdConfig.isPacked = mSymbolEnv.isPacked(field) || isStorageBufferVec3;
+    evdConfig.isUBO    = mSymbolEnv.isUBO(field);
+    const bool isRuntimeStorageArray =
+        parent.isImplementingShaderStorageBlock() && type.isUnsizedArray();
+    evdConfig.isPointer   = isRuntimeStorageArray ? nullptr : mSymbolEnv.isPointer(field);
+    evdConfig.isReference = mSymbolEnv.isReference(field);
+    static constexpr AddressSpace kDeviceAddressSpace = AddressSpace::Device;
+    if (!isRuntimeStorageArray && !evdConfig.isPointer && type.isUnsizedArray())
+    {
+        evdConfig.isPointer = &kDeviceAddressSpace;
+    }
+    if (usesStorageBufferStructVariant)
+    {
+        // Nested storage-block structures use a layout-specific padded MSL type.
+    }
+    else if (usesStorageBufferMatrixWrapper)
+    {
+        // Matrix fields use a structure with explicit GLSL row or column strides.
+    }
+    else if (usesStorageBufferArrayWrapper)
+    {
+        mOut << "metal::array<"
+             << GetStorageBufferArrayWrapperName(parent, field,
+                                                 Overlay(TLayoutBlockStorage::EbsStd430, type))
+             << ", " << type.getOutermostArraySize() << "> ";
+        emitNameOf(field);
+    }
+    else
+    {
+        emitVariableDeclaration(VarDecl(field), evdConfig);
+    }
+
+    const TQualifier qual                   = type.getQualifier();
+    const TLayoutQualifier &layoutQualifier = type.getLayoutQualifier();
+    const bool isExternalVarying            = mPipelineStructs.vertexOut.external == &parent ||
+                                              mPipelineStructs.fragmentIn.external == &parent;
+    const bool hasExplicitVaryingLocation = isExternalVarying && layoutQualifier.locationsSpecified;
+    bool varyingLocationEmitted           = false;
+    auto appendVaryingLocation            = [&]() {
+        if (hasExplicitVaryingLocation)
+        {
+            mOut << ", user(locn" << layoutQualifier.location << ")";
+            varyingLocationEmitted = true;
+        }
+    };
     switch (qual)
     {
         case TQualifier::EvqFlatIn:
             if (mPipelineStructs.fragmentIn.external == &parent)
             {
-                mOut << " [[flat]]";
+                mOut << " [[flat";
+                appendVaryingLocation();
+                mOut << "]]";
                 TranslatorMetalReflection *reflection =
                     mtl::getTranslatorMetalReflection(&mCompiler);
                 reflection->hasFlatInput = true;
@@ -1215,35 +1837,45 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
         case TQualifier::EvqNoPerspectiveIn:
             if (mPipelineStructs.fragmentIn.external == &parent && !type.isInterpolant())
             {
-                mOut << " [[center_no_perspective]]";
+                mOut << " [[center_no_perspective";
+                appendVaryingLocation();
+                mOut << "]]";
             }
             break;
 
         case TQualifier::EvqCentroidIn:
             if (mPipelineStructs.fragmentIn.external == &parent && !type.isInterpolant())
             {
-                mOut << " [[centroid_perspective]]";
+                mOut << " [[centroid_perspective";
+                appendVaryingLocation();
+                mOut << "]]";
             }
             break;
 
         case TQualifier::EvqSampleIn:
             if (mPipelineStructs.fragmentIn.external == &parent && !type.isInterpolant())
             {
-                mOut << " [[sample_perspective]]";
+                mOut << " [[sample_perspective";
+                appendVaryingLocation();
+                mOut << "]]";
             }
             break;
 
         case TQualifier::EvqNoPerspectiveCentroidIn:
             if (mPipelineStructs.fragmentIn.external == &parent && !type.isInterpolant())
             {
-                mOut << " [[centroid_no_perspective]]";
+                mOut << " [[centroid_no_perspective";
+                appendVaryingLocation();
+                mOut << "]]";
             }
             break;
 
         case TQualifier::EvqNoPerspectiveSampleIn:
             if (mPipelineStructs.fragmentIn.external == &parent && !type.isInterpolant())
             {
-                mOut << " [[sample_no_perspective]]";
+                mOut << " [[sample_no_perspective";
+                appendVaryingLocation();
+                mOut << "]]";
             }
             break;
 
@@ -1272,7 +1904,6 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
                     // location is 0. So, when we get to this point the shader
                     // will have been rejected if locations are not specified
                     // and there is more than one output.
-                    const TLayoutQualifier &layoutQualifier = type.getLayoutQualifier();
                     if (layoutQualifier.locationsSpecified)
                     {
                         mOut << " [[color(" << layoutQualifier.location << ")";
@@ -1342,22 +1973,28 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
             break;
     }
 
+    if (hasExplicitVaryingLocation && !varyingLocationEmitted)
+    {
+        mOut << " [[user(locn" << layoutQualifier.location << ")]]";
+    }
+
     if (IsImage(type.getBasicType()))
     {
-        if (type.getArraySizeProduct() != 1)
-        {
-            UNIMPLEMENTED();
-        }
-        mOut << " [[";
-        if (type.getLayoutQualifier().rasterOrdered)
-        {
-            mOut << "raster_order_group(0), ";
-        }
-        mOut << "texture(" << mMainTextureIndex << ")]]";
+        const uint32_t imageArraySize =
+            type.isArray() ? static_cast<uint32_t>(type.getArraySizeProduct()) : 1;
         TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
-        reflection->addRWTextureBinding(type.getLayoutQualifier().binding,
-                                        static_cast<int>(mMainTextureIndex));
-        ++mMainTextureIndex;
+        for (uint32_t arrayElement = 0; arrayElement < imageArraySize; ++arrayElement)
+        {
+            mOut << " [[";
+            if (type.getLayoutQualifier().rasterOrdered)
+            {
+                mOut << "raster_order_group(0), ";
+            }
+            mOut << "texture(" << mMainTextureIndex + arrayElement << ")]]";
+            reflection->addRWTextureBinding(field.name().data(), arrayElement,
+                                            static_cast<int>(mMainTextureIndex + arrayElement));
+        }
+        mMainTextureIndex += imageArraySize;
     }
 }
 
@@ -1464,10 +2101,267 @@ void GenMetalTraverser::emitUniformBufferDeclaration(const TField &field,
     annotationIndices.attribute += arraySize;
 }
 
+void GenMetalTraverser::emitStorageBufferDeclaration(const TField &field,
+                                                     FieldAnnotationIndices &annotationIndices)
+{
+    const TType &type                = *field.type();
+    const AddressSpace *addressSpace = mSymbolEnv.isPointer(field);
+    if (type.isArray() && addressSpace)
+    {
+        // Each array element is a separate GL buffer binding. Keep the device pointer inside the
+        // MSL array instead of making one device pointer to an array of block structs.
+        EmitMetalArrayTypePrefix(mOut, type.getArraySizes());
+        mOut << toString(*addressSpace) << " ";
+        TType baseType = type;
+        baseType.toArrayBaseType();
+        emitBareTypeName(baseType, EmitTypeConfig{nullptr});
+        mOut << " *";
+        EmitMetalArrayTypeSuffix(mOut, type.getArraySizes());
+        mOut << " ";
+        emitNameOf(field);
+    }
+    else
+    {
+        EmitVariableDeclarationConfig evdConfig;
+        evdConfig.disableStructSpecifier = true;
+        evdConfig.isPointer              = addressSpace;
+        emitVariableDeclaration(VarDecl(field), evdConfig);
+    }
+    mOut << "[[id(" << annotationIndices.attribute << ")]]";
+
+    const int arraySize = type.isArray() ? type.getArraySizeProduct() : 1;
+
+    TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
+    ASSERT(type.getBasicType() == TBasicType::EbtStruct);
+    const TStructure *structure    = type.getStruct();
+    const std::string originalName = structure->name().data();
+    reflection->addStorageBufferBinding(
+        originalName,
+        {.bindIndex = annotationIndices.attribute, .arraySize = static_cast<size_t>(arraySize)});
+
+    annotationIndices.attribute += arraySize;
+}
+
+void GenMetalTraverser::emitStorageBufferLengthDeclaration(
+    const TField &field,
+    FieldAnnotationIndices &annotationIndices)
+{
+    const TType &type   = *field.type();
+    const int arraySize = type.isArray() ? type.getArraySizeProduct() : 1;
+
+    if (type.isArray())
+    {
+        EmitMetalArrayTypePrefix(mOut, type.getArraySizes());
+        mOut << "constant uint *";
+        EmitMetalArrayTypeSuffix(mOut, type.getArraySizes());
+        mOut << " ";
+    }
+    else
+    {
+        mOut << "constant uint *";
+    }
+    emitNameOf(field);
+    mOut << "_length [[id(" << annotationIndices.attribute << ")]]";
+    annotationIndices.attribute += arraySize;
+}
+
+void GenMetalTraverser::emitStorageBufferArrayWrapper(const TStructure &parent,
+                                                      const TField &field,
+                                                      TLayoutBlockStorage storage)
+{
+    size_t stride = 0;
+    if (!GetStorageBufferArrayWrapperStride(*field.type(), &stride, storage))
+    {
+        return;
+    }
+
+    const std::string wrapperName = GetStorageBufferArrayWrapperName(parent, field, storage);
+    if (!mEmittedStorageBufferArrayWrappers.insert(wrapperName).second)
+    {
+        return;
+    }
+
+    TType elementType(*field.type());
+    elementType.toArrayElementType();
+    mOut << "struct alignas(" << stride << ") " << wrapperName << " { ";
+    emitType(elementType, {});
+    mOut << " value; };\n";
+}
+
+std::string GenMetalTraverser::getStorageBufferStructVariantName(const TStructure &structure,
+                                                                 TLayoutBlockStorage storage,
+                                                                 TLayoutMatrixPacking packing) const
+{
+    return "ANGLE_SSBO_struct_" + std::to_string(structure.uniqueId().get()) + "_" +
+           std::to_string(static_cast<int>(storage)) + "_" +
+           std::to_string(static_cast<int>(packing));
+}
+
+void GenMetalTraverser::emitStorageBufferPadding(size_t byteCount, size_t padIndex)
+{
+    ASSERT(byteCount % sizeof(uint32_t) == 0);
+    if (byteCount == 0)
+    {
+        return;
+    }
+    mOut << "  metal::array<uint, " << byteCount / sizeof(uint32_t) << "> _ANGLE_SSBO_pad_"
+         << padIndex << ";\n";
+}
+
+void GenMetalTraverser::emitStorageBufferStructVariant(const TStructure &structure,
+                                                       TLayoutBlockStorage storage,
+                                                       TLayoutMatrixPacking packing)
+{
+    const std::string variantName = getStorageBufferStructVariantName(structure, storage, packing);
+    if (!mEmittedStorageBufferStructVariants.insert(variantName).second)
+    {
+        return;
+    }
+
+    for (const TField *field : structure.fields())
+    {
+        const TLayoutBlockStorage fieldStorage  = Overlay(storage, *field->type());
+        const TLayoutMatrixPacking fieldPacking = Overlay(packing, *field->type());
+        TType baseType(*field->type());
+        baseType.toArrayBaseType();
+        if (const TStructure *nested = baseType.getStruct();
+            nested && NeedsStorageBufferStructVariant(*nested, fieldStorage, fieldPacking))
+        {
+            emitStorageBufferStructVariant(*nested, fieldStorage, fieldPacking);
+        }
+        emitStorageBufferArrayWrapper(structure, *field, fieldStorage);
+    }
+
+    TType structureType(&structure, false);
+    const Layout structureLayout = GetGlslStorageBufferLayoutOf(structureType, storage, packing);
+    mOut << "struct alignas(" << structureLayout.alignOf << ") " << variantName << "\n{\n";
+
+    size_t offset   = 0;
+    size_t padIndex = 0;
+    for (const TField *field : structure.fields())
+    {
+        const TType &fieldType                  = *field->type();
+        const TLayoutBlockStorage fieldStorage  = Overlay(storage, fieldType);
+        const TLayoutMatrixPacking fieldPacking = Overlay(packing, fieldType);
+        const Layout fieldLayout =
+            GetGlslStorageBufferLayoutOf(fieldType, fieldStorage, fieldPacking);
+        const size_t fieldOffset = RoundUpToStorageAlignment(offset, fieldLayout.alignOf);
+        emitStorageBufferPadding(fieldOffset - offset, padIndex++);
+        mOut << "  ";
+
+        TType baseType(fieldType);
+        baseType.toArrayBaseType();
+        const TStructure *nested = baseType.getStruct();
+        if (nested && NeedsStorageBufferStructVariant(*nested, fieldStorage, fieldPacking))
+        {
+            if (fieldType.isArray())
+            {
+                EmitMetalArrayTypePrefix(mOut, fieldType.getArraySizes());
+            }
+            mOut << getStorageBufferStructVariantName(*nested, fieldStorage, fieldPacking);
+            if (fieldType.isArray())
+            {
+                EmitMetalArrayTypeSuffix(mOut, fieldType.getArraySizes(),
+                                         fieldType.isUnsizedArray());
+            }
+            mOut << " ";
+            emitNameOf(*field);
+        }
+        else if (nested)
+        {
+            EmitVariableDeclarationConfig fieldConfig;
+            fieldConfig.disableStructSpecifier = true;
+            emitType(fieldType, EmitTypeConfig{&fieldConfig});
+            mOut << " ";
+            emitNameOf(*field);
+        }
+        else
+        {
+            size_t arrayStride = 0;
+            if (GetStorageBufferArrayWrapperStride(fieldType, &arrayStride, fieldStorage))
+            {
+                mOut << "metal::array<"
+                     << GetStorageBufferArrayWrapperName(structure, *field, fieldStorage) << ", "
+                     << fieldType.getOutermostArraySize() << "> ";
+                emitNameOf(*field);
+            }
+            else
+            {
+                EmitVariableDeclarationConfig fieldConfig;
+                fieldConfig.disableStructSpecifier = true;
+                const bool isVec3    = !fieldType.isArray() && fieldType.isVector() &&
+                                       fieldType.getNominalSize() == 3 &&
+                                       (fieldType.getBasicType() == TBasicType::EbtFloat ||
+                                        fieldType.getBasicType() == TBasicType::EbtInt ||
+                                        fieldType.getBasicType() == TBasicType::EbtUInt);
+                fieldConfig.isPacked = isVec3;
+                if (isVec3)
+                {
+                    mOut << "alignas(" << fieldLayout.alignOf << ") ";
+                }
+                emitType(fieldType, EmitTypeConfig{&fieldConfig});
+                mOut << " ";
+                emitNameOf(*field);
+            }
+        }
+        mOut << ";\n";
+        offset = fieldOffset + fieldLayout.sizeOf;
+    }
+
+    emitStorageBufferPadding(structureLayout.sizeOf - offset, padIndex);
+    mOut << "};\n";
+}
+
 void GenMetalTraverser::emitStructDeclaration(const TType &type)
 {
     ASSERT(type.getBasicType() == TBasicType::EbtStruct);
     ASSERT(type.isStructSpecifier());
+
+    const TStructure &structure = *type.getStruct();
+    if (structure.isImplementingShaderStorageBlock())
+    {
+        for (const TField *field : structure.fields())
+        {
+            const TLayoutBlockStorage storage =
+                Overlay(TLayoutBlockStorage::EbsStd430, *field->type());
+            const TLayoutMatrixPacking packing =
+                Overlay(TLayoutMatrixPacking::EmpColumnMajor, *field->type());
+            TType baseType(*field->type());
+            baseType.toArrayBaseType();
+            if (const TStructure *nested = baseType.getStruct();
+                nested && NeedsStorageBufferStructVariant(*nested, storage, packing))
+            {
+                emitStorageBufferStructVariant(*nested, storage, packing);
+            }
+            emitStorageBufferArrayWrapper(structure, *field, storage);
+
+            if (NeedsStorageBufferMatrixWrapper(*field->type()))
+            {
+                TType matrixType(*field->type());
+                matrixType.toArrayBaseType();
+                size_t majorCount;
+                size_t vectorSize;
+                size_t vectorStride;
+                bool isRowMajor;
+                GetStorageBufferMatrixLayout(matrixType, &majorCount, &vectorSize, &vectorStride,
+                                             &isRowMajor);
+
+                mOut << "struct alignas(" << vectorStride << ") "
+                     << GetStorageBufferMatrixWrapperName(structure, *field) << " {\n";
+                for (size_t major = 0; major < majorCount; ++major)
+                {
+                    TType vectorType(TBasicType::EbtFloat, static_cast<uint8_t>(vectorSize));
+                    EmitVariableDeclarationConfig packedConfig;
+                    packedConfig.isPacked = true;
+                    mOut << "  alignas(" << vectorStride << ") ";
+                    emitType(vectorType, EmitTypeConfig{&packedConfig});
+                    mOut << " " << (isRowMajor ? "row" : "column") << major << ";\n";
+                }
+                mOut << "};\n";
+                mStorageBufferMatrixFields.emplace_back(&structure, field);
+            }
+        }
+    }
 
     mOut << "struct ";
     emitBareTypeName(type, {});
@@ -1475,10 +2369,10 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
     mOut << "\n";
     emitOpenBrace();
 
-    const TStructure &structure = *type.getStruct();
     std::map<Name, size_t> fieldToAttributeIndex;
     const bool hasAttributeIndices      = mPipelineStructs.vertexIn.external == &structure;
     const bool hasUniformBufferIndicies = mPipelineStructs.uniformBuffers.external == &structure;
+    const bool hasStorageBufferIndices  = mPipelineStructs.storageBuffers.external == &structure;
     const bool reclaimUnusedAttributeIndices = mCompiler.getShaderVersion() < 300;
 
     if (hasAttributeIndices)
@@ -1497,9 +2391,24 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
     }
 
     FieldAnnotationIndices annotationIndices;
+    size_t storageBufferOffset   = 0;
+    size_t storageBufferPadIndex = 0;
 
     for (const TField *field : structure.fields())
     {
+        size_t storageBufferFieldOffset = 0;
+        Layout storageBufferFieldLayout = Layout::Identity();
+        if (structure.isImplementingShaderStorageBlock())
+        {
+            storageBufferFieldLayout =
+                GetGlslStorageBufferLayoutOf(*field->type(), TLayoutBlockStorage::EbsStd430,
+                                             TLayoutMatrixPacking::EmpColumnMajor);
+            storageBufferFieldOffset =
+                RoundUpToStorageAlignment(storageBufferOffset, storageBufferFieldLayout.alignOf);
+            emitStorageBufferPadding(storageBufferFieldOffset - storageBufferOffset,
+                                     storageBufferPadIndex++);
+        }
+
         emitIndentation();
         if (hasAttributeIndices)
         {
@@ -1527,11 +2436,25 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
         {
             emitUniformBufferDeclaration(*field, annotationIndices);
         }
+        else if (hasStorageBufferIndices)
+        {
+            emitStorageBufferDeclaration(*field, annotationIndices);
+        }
         else
         {
             emitFieldDeclaration(*field, structure, annotationIndices);
         }
         mOut << ";\n";
+        if (structure.isImplementingShaderStorageBlock())
+        {
+            storageBufferOffset = storageBufferFieldOffset + storageBufferFieldLayout.sizeOf;
+        }
+        if (hasStorageBufferIndices)
+        {
+            emitIndentation();
+            emitStorageBufferLengthDeclaration(*field, annotationIndices);
+            mOut << ";\n";
+        }
     }
 
     emitCloseBrace();
@@ -1617,6 +2540,52 @@ void GenMetalTraverser::visitSymbol(TIntermSymbol *symbolNode)
     const TVariable &var = symbolNode->variable();
     const TType &type    = var.getType();
     ASSERT(var.symbolType() != SymbolType::Empty);
+
+    if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+    {
+        switch (type.getQualifier())
+        {
+            case TQualifier::EvqGlobalInvocationID:
+                mOut << "ANGLE_globalInvocationID";
+                return;
+            case TQualifier::EvqLocalInvocationID:
+                mOut << "ANGLE_localInvocationID";
+                return;
+            case TQualifier::EvqLocalInvocationIndex:
+                mOut << "ANGLE_localInvocationIndex";
+                return;
+            case TQualifier::EvqNumWorkGroups:
+                mOut << "ANGLE_numWorkGroups";
+                return;
+            case TQualifier::EvqWorkGroupID:
+                mOut << "ANGLE_workGroupID";
+                return;
+            case TQualifier::EvqWorkGroupSize:
+            {
+                const sh::WorkGroupSize &localSize = mCompiler.getComputeShaderLocalSize();
+                mOut << "metal::uint3(" << localSize[0] << ", " << localSize[1] << ", "
+                     << localSize[2] << ")";
+                return;
+            }
+            default:
+                break;
+        }
+
+        if (type.getQualifier() == TQualifier::EvqShared)
+        {
+            if (mIsComputeMain)
+            {
+                emitNameOf(var);
+            }
+            else
+            {
+                mOut << "(*";
+                emitNameOf(var);
+                mOut << ")";
+            }
+            return;
+        }
+    }
 
     if (type.getBasicType() == TBasicType::EbtVoid)
     {
@@ -1793,11 +2762,214 @@ const TField &GenMetalTraverser::getDirectField(const TIntermTyped &fieldsNode,
     return getDirectField(*fieldListCollection, index);
 }
 
+const TField *GenMetalTraverser::getStorageBufferField(TIntermTyped &expression,
+                                                       const TStructure **parentOut)
+{
+    TIntermTyped *cursor = &expression;
+    while (TIntermBinary *binary = cursor->getAsBinaryNode())
+    {
+        if (binary->getOp() == TOperator::EOpIndexDirectStruct ||
+            binary->getOp() == TOperator::EOpIndexDirectInterfaceBlock)
+        {
+            const TStructure *structure = binary->getLeft()->getType().getStruct();
+            if (structure && structure->isImplementingShaderStorageBlock())
+            {
+                if (parentOut)
+                {
+                    *parentOut = structure;
+                }
+                return &getDirectField(*binary->getLeft(), *binary->getRight());
+            }
+        }
+        cursor = binary->getLeft();
+    }
+    return nullptr;
+}
+
+const TField *GenMetalTraverser::getStorageBufferArrayField(TIntermTyped &expression)
+{
+    const TField *arrayField       = nullptr;
+    TIntermTyped *cursor           = &expression;
+    TLayoutBlockStorage storage    = TLayoutBlockStorage::EbsStd430;
+    bool isStorageBufferExpression = false;
+
+    while (TIntermBinary *binary = cursor->getAsBinaryNode())
+    {
+        if (binary->getOp() == TOperator::EOpIndexDirectStruct ||
+            binary->getOp() == TOperator::EOpIndexDirectInterfaceBlock)
+        {
+            const TStructure *structure = binary->getLeft()->getType().getStruct();
+            if (structure)
+            {
+                const TField &field = getDirectField(*binary->getLeft(), *binary->getRight());
+                if (!arrayField && field.type()->isArray())
+                {
+                    arrayField = &field;
+                }
+                if (structure->isImplementingShaderStorageBlock())
+                {
+                    storage = Overlay(TLayoutBlockStorage::EbsStd430, *field.type());
+                    isStorageBufferExpression = true;
+                }
+            }
+        }
+        cursor = binary->getLeft();
+    }
+
+    size_t stride = 0;
+    if (!isStorageBufferExpression || !arrayField ||
+        !GetStorageBufferArrayWrapperStride(*arrayField->type(), &stride, storage))
+    {
+        return nullptr;
+    }
+
+    return arrayField;
+}
+
 bool GenMetalTraverser::visitBinary(Visit, TIntermBinary *binaryNode)
 {
     const TOperator op      = binaryNode->getOp();
     TIntermTyped &leftNode  = *binaryNode->getLeft();
     TIntermTyped &rightNode = *binaryNode->getRight();
+
+    const TStructure *matrixParent = nullptr;
+    const TField *matrixField =
+        leftNode.getType().isMatrix() ? getStorageBufferField(leftNode, &matrixParent) : nullptr;
+    if (op == TOperator::EOpAssign && matrixField &&
+        NeedsStorageBufferMatrixWrapper(*matrixField->type()))
+    {
+        mOut << GetStorageBufferMatrixWrapperName(*matrixParent, *matrixField) << "_store(&(";
+        mSuppressStorageBufferMatrixLoad = true;
+        groupedTraverse(leftNode);
+        mSuppressStorageBufferMatrixLoad = false;
+        mOut << "), ";
+        groupedTraverse(rightNode);
+        mOut << ")";
+        return false;
+    }
+
+    const bool isMatrixStorageAccess =
+        op == TOperator::EOpIndexDirectStruct || op == TOperator::EOpIndexDirectInterfaceBlock ||
+        op == TOperator::EOpIndexDirect || op == TOperator::EOpIndexIndirect;
+    if (!mSuppressStorageBufferMatrixLoad && isMatrixStorageAccess &&
+        binaryNode->getType().isMatrix())
+    {
+        const TStructure *parent = nullptr;
+        const TField *field      = getStorageBufferField(*binaryNode, &parent);
+        if (field && NeedsStorageBufferMatrixWrapper(*field->type()))
+        {
+            mOut << GetStorageBufferMatrixWrapperName(*parent, *field) << "_load(";
+            mSuppressStorageBufferMatrixLoad = true;
+            groupedTraverse(*binaryNode);
+            mSuppressStorageBufferMatrixLoad = false;
+            mOut << ")";
+            return false;
+        }
+    }
+
+    // Metal's matrix *= overloads don't accept device-address-space matrices from SSBOs. Emit
+    // matrix compound multiplication as a normal load, multiply, and store instead.
+    if ((op == TOperator::EOpMatrixTimesMatrixAssign ||
+         op == TOperator::EOpMatrixTimesScalarAssign) &&
+        leftNode.getType().isMatrix())
+    {
+        if (matrixField && NeedsStorageBufferMatrixWrapper(*matrixField->type()))
+        {
+            const std::string wrapperName =
+                GetStorageBufferMatrixWrapperName(*matrixParent, *matrixField);
+            mOut << wrapperName << "_store(&(";
+            mSuppressStorageBufferMatrixLoad = true;
+            groupedTraverse(leftNode);
+            mSuppressStorageBufferMatrixLoad = false;
+            mOut << "), " << wrapperName << "_load(";
+            mSuppressStorageBufferMatrixLoad = true;
+            groupedTraverse(leftNode);
+            mSuppressStorageBufferMatrixLoad = false;
+            mOut << ") * ";
+            groupedTraverse(rightNode);
+            mOut << ")";
+            return false;
+        }
+
+        groupedTraverse(leftNode);
+        mOut << " = ";
+        groupedTraverse(leftNode);
+        mOut << " * ";
+        groupedTraverse(rightNode);
+        return false;
+    }
+
+    // Metal can lower dynamic vector-component assignments to a vector read/modify/write. Address
+    // the scalar component directly so concurrent invocations updating different components do
+    // not overwrite each other's updates.
+    if (op == TOperator::EOpAssign)
+    {
+        TIntermBinary *componentAccess = leftNode.getAsBinaryNode();
+        TIntermTyped *vectorExpression = componentAccess ? componentAccess->getLeft() : nullptr;
+        if (componentAccess &&
+            (componentAccess->getOp() == TOperator::EOpIndexDirect ||
+             componentAccess->getOp() == TOperator::EOpIndexIndirect) &&
+            vectorExpression && vectorExpression->getType().isVector())
+        {
+            const AddressSpace *vectorAddressSpace = nullptr;
+            TIntermNode *vectorNode                = vectorExpression;
+            while (vectorNode)
+            {
+                if (TIntermSymbol *symbol = vectorNode->getAsSymbolNode())
+                {
+                    if (symbol->getType().getQualifier() == TQualifier::EvqShared)
+                    {
+                        vectorAddressSpace = &kThreadgroupAddressSpace;
+                    }
+                    else
+                    {
+                        vectorAddressSpace = mSymbolEnv.isPointer(symbol->variable());
+                    }
+                    break;
+                }
+
+                TIntermBinary *fieldAccess = vectorNode->getAsBinaryNode();
+                if (!fieldAccess)
+                {
+                    break;
+                }
+                if (fieldAccess->getOp() == TOperator::EOpIndexDirectStruct ||
+                    fieldAccess->getOp() == TOperator::EOpIndexDirectInterfaceBlock)
+                {
+                    const TField &field =
+                        getDirectField(*fieldAccess->getLeft(), *fieldAccess->getRight());
+                    vectorAddressSpace = mSymbolEnv.isPointer(field);
+                    if (vectorAddressSpace)
+                    {
+                        break;
+                    }
+                }
+                vectorNode = fieldAccess->getLeft();
+            }
+
+            TIntermBinary *matrixColumn = vectorExpression->getAsBinaryNode();
+            const bool isDeviceMatrixColumn =
+                vectorAddressSpace && *vectorAddressSpace == AddressSpace::Device && matrixColumn &&
+                (matrixColumn->getOp() == TOperator::EOpIndexDirect ||
+                 matrixColumn->getOp() == TOperator::EOpIndexIndirect) &&
+                matrixColumn->getLeft()->getType().isMatrix();
+            if (isDeviceMatrixColumn ||
+                (vectorAddressSpace && *vectorAddressSpace == AddressSpace::Threadgroup))
+            {
+                mOut << "reinterpret_cast<" << toString(*vectorAddressSpace) << " ";
+                emitType(leftNode.getType(), {});
+                mOut << " *>(&";
+                groupedTraverse(*vectorExpression);
+                mOut << ")[ANGLE_int_clamp(";
+                groupedTraverse(*componentAccess->getRight());
+                mOut << ", 0, "
+                     << static_cast<uint32_t>(vectorExpression->getType().getNominalSize() - 1)
+                     << ")] = ";
+                groupedTraverse(rightNode);
+                return false;
+            }
+        }
+    }
 
     switch (op)
     {
@@ -1805,7 +2977,7 @@ bool GenMetalTraverser::visitBinary(Visit, TIntermBinary *binaryNode)
         case TOperator::EOpIndexDirectInterfaceBlock:
         {
             const TField &field = getDirectField(leftNode, rightNode);
-            if (mSymbolEnv.isPointer(field) && mSymbolEnv.isUBO(field))
+            if (mSymbolEnv.isPointer(field))
             {
                 emitOpeningPointerParen();
             }
@@ -1822,10 +2994,25 @@ bool GenMetalTraverser::visitBinary(Visit, TIntermBinary *binaryNode)
         case TOperator::EOpIndexDirect:
         case TOperator::EOpIndexIndirect:
         {
-            TType leftType = leftNode.getType();
+            TType leftType                   = leftNode.getType();
+            const TConstantUnion *constIndex = rightNode.getConstantValue();
+            if (leftType.isArray() && IsImage(leftType.getBasicType()) && constIndex != nullptr)
+            {
+                TIntermBinary *fieldAccess = leftNode.getAsBinaryNode();
+                if (fieldAccess && fieldAccess->getOp() == TOperator::EOpIndexDirectStruct)
+                {
+                    const TField &field =
+                        getDirectField(*fieldAccess->getLeft(), *fieldAccess->getRight());
+                    groupedTraverse(*fieldAccess->getLeft());
+                    mOut << ".";
+                    emitNameOf(field);
+                    mOut << "_ANGLE_image_element_" << constIndex->getIConst();
+                    break;
+                }
+            }
+
             groupedTraverse(leftNode);
             mOut << "[";
-            const TConstantUnion *constIndex = rightNode.getConstantValue();
             // TODO(anglebug.com/42266914): Convert type and bound checks to
             // assertions after AST validation is enabled for MSL translation.
             if (!leftType.isUnsizedArray() && constIndex != nullptr &&
@@ -1836,32 +3023,36 @@ bool GenMetalTraverser::visitBinary(Visit, TIntermBinary *binaryNode)
             {
                 emitSingleConstant(constIndex);
             }
+            else if (leftType.isUnsizedArray())
+            {
+                // Runtime arrays are emitted as device pointers.  Their valid range is
+                // supplied by the host-side SSBO length metadata; clamping against a
+                // pointer's .size() is not valid MSL.
+                groupedTraverse(rightNode);
+            }
             else
             {
                 mOut << "ANGLE_int_clamp(";
                 groupedTraverse(rightNode);
                 mOut << ", 0, ";
-                if (leftType.isUnsizedArray())
+                uint32_t maxSize;
+                if (leftType.isArray())
                 {
-                    groupedTraverse(leftNode);
-                    mOut << ".size()";
+                    maxSize = leftType.getOutermostArraySize() - 1;
                 }
                 else
                 {
-                    uint32_t maxSize;
-                    if (leftType.isArray())
-                    {
-                        maxSize = leftType.getOutermostArraySize() - 1;
-                    }
-                    else
-                    {
-                        maxSize = leftType.getNominalSize() - 1;
-                    }
-                    mOut << maxSize;
+                    maxSize = leftType.getNominalSize() - 1;
                 }
+                mOut << maxSize;
                 mOut << ")";
             }
             mOut << "]";
+            const TField *storageBufferArrayField = getStorageBufferArrayField(leftNode);
+            if (leftType.isArray() && storageBufferArrayField)
+            {
+                mOut << ".value";
+            }
         }
         break;
 
@@ -1940,6 +3131,65 @@ bool GenMetalTraverser::visitUnary(Visit, TIntermUnary *unaryNode)
 
     TIntermTyped &arg    = *unaryNode->getOperand();
     const TType &argType = arg.getType();
+
+    if (op == TOperator::EOpArrayLength)
+    {
+        // A Metal device pointer has no length metadata.  The compute runtime supplies a small
+        // constant length buffer for every SSBO, exposed as a sibling argument-buffer field.
+        TIntermTyped *storageBufferExpression = nullptr;
+        const TField *storageBufferField      = nullptr;
+        TIntermTyped *storageBufferArrayIndex = nullptr;
+        TIntermTyped *cursor                  = &arg;
+        while (TIntermBinary *binary = cursor->getAsBinaryNode())
+        {
+            if (binary->getOp() == TOperator::EOpIndexDirect &&
+                binary->getLeft()->getType().isArray())
+            {
+                const TStructure *indexedStructure = binary->getLeft()->getType().getStruct();
+                if (indexedStructure && indexedStructure->isImplementingShaderStorageBlock())
+                {
+                    // GLES requires constant integral indices for storage-block arrays. Preserve
+                    // the selected element so its runtime-array length comes from that binding.
+                    storageBufferArrayIndex = binary->getRight();
+                }
+            }
+
+            if (binary->getOp() == TOperator::EOpIndexDirectStruct ||
+                binary->getOp() == TOperator::EOpIndexDirectInterfaceBlock)
+            {
+                TIntermTyped *left              = binary->getLeft();
+                TIntermTyped *right             = binary->getRight();
+                const TStructure *leftStructure = left->getType().getStruct();
+                if (leftStructure && mPipelineStructs.storageBuffers.matches(*leftStructure))
+                {
+                    storageBufferExpression = left;
+                    storageBufferField      = &getDirectField(*left, *right);
+                    break;
+                }
+            }
+            cursor = binary->getLeft();
+        }
+
+        if (storageBufferExpression && storageBufferField)
+        {
+            mOut << "int(*";
+            groupedTraverse(*storageBufferExpression);
+            mOut << ".";
+            emitNameOf(*storageBufferField);
+            mOut << "_length";
+            if (storageBufferArrayIndex)
+            {
+                mOut << "[";
+                groupedTraverse(*storageBufferArrayIndex);
+                mOut << "]";
+            }
+            mOut << ")";
+            return false;
+        }
+
+        UNIMPLEMENTED();
+        return false;
+    }
 
     if (op == TOperator::EOpIsnan || op == TOperator::EOpIsinf)
     {
@@ -2067,7 +3317,17 @@ void GenMetalTraverser::emitFunctionSignature(const TFunction &func)
     }
     mOut << "(";
 
-    bool emitComma          = false;
+    bool emitComma = false;
+    if (isMain && mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+    {
+        mOut << "metal::uint3 ANGLE_globalInvocationID [[thread_position_in_grid]], "
+             << "metal::uint3 ANGLE_localInvocationID [[thread_position_in_threadgroup]], "
+             << "uint32_t ANGLE_localInvocationIndex [[thread_index_in_threadgroup]], "
+             << "metal::uint3 ANGLE_workGroupID [[threadgroup_position_in_grid]], "
+             << "metal::uint3 ANGLE_numWorkGroups [[threadgroups_per_grid]]";
+        emitComma = true;
+    }
+
     const size_t paramCount = func.getParamCount();
     for (size_t i = 0; i < paramCount; ++i)
     {
@@ -2081,9 +3341,50 @@ void GenMetalTraverser::emitFunctionSignature(const TFunction &func)
         emitFunctionParameter(func, param);
     }
 
+    if (!isMain && func.symbolType() == SymbolType::UserDefined)
+    {
+        for (const TVariable *sharedVariable : mSharedVariables)
+        {
+            if (emitComma)
+            {
+                mOut << ", ";
+            }
+            emitComma = true;
+
+            EmitVariableDeclarationConfig evdConfig;
+            evdConfig.isParameter            = true;
+            evdConfig.disableStructSpecifier = true;
+            evdConfig.isPointer              = &kThreadgroupAddressSpace;
+            emitVariableDeclaration(VarDecl(*sharedVariable), evdConfig);
+        }
+
+        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+        {
+            for (const char *builtin :
+                 {"metal::uint3 ANGLE_globalInvocationID", "metal::uint3 ANGLE_localInvocationID",
+                  "uint32_t ANGLE_localInvocationIndex", "metal::uint3 ANGLE_workGroupID",
+                  "metal::uint3 ANGLE_numWorkGroups"})
+            {
+                if (emitComma)
+                {
+                    mOut << ", ";
+                }
+                emitComma = true;
+                mOut << builtin;
+            }
+        }
+    }
+
     if (isTraversingVertexMain)
     {
         mOut << " @@XFB-Bindings@@ ";
+        mOut << "\n#if TRANSFORM_FEEDBACK_ENABLED\n, device ";
+        emitType(func.getReturnType(), EmitTypeConfig{});
+        mOut << " * ANGLE_xfbReplayBuffer [[buffer(" << (mSSBOArgumentBufferBindingIndex + 1)
+             << ")]]\n#elif TRANSFORM_FEEDBACK_REPLAY\n, device const ";
+        emitType(func.getReturnType(), EmitTypeConfig{});
+        mOut << " * ANGLE_xfbReplayBuffer [[buffer(" << (mSSBOArgumentBufferBindingIndex + 1)
+             << ")]]\n#endif\n";
     }
 
     mOut << ")";
@@ -2096,29 +3397,38 @@ void GenMetalTraverser::emitFunctionReturn(const TFunction &func)
     const TType &returnType = func.getReturnType();
     if (isMain)
     {
-        const TStructure *structure = returnType.getStruct();
-        if (mPipelineStructs.fragmentOut.matches(*structure))
+        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
         {
-            if (mCompiler.isEarlyFragmentTestsSpecified())
-            {
-                mOut << "[[early_fragment_tests]]\n";
-            }
-            mOut << "fragment ";
-        }
-        else if (mPipelineStructs.vertexOut.matches(*structure))
-        {
-            ASSERT(structure != nullptr);
-            mOut << "vertex __VERTEX_OUT(";
-            isVertexMain = true;
+            mOut << "kernel ";
         }
         else
         {
-            UNIMPLEMENTED();
+            const TStructure *structure = returnType.getStruct();
+            if (mPipelineStructs.fragmentOut.matches(*structure))
+            {
+                if (mCompiler.isEarlyFragmentTestsSpecified())
+                {
+                    mOut << "[[early_fragment_tests]]\n";
+                }
+                mOut << "fragment ";
+            }
+            else if (mPipelineStructs.vertexOut.matches(*structure))
+            {
+                ASSERT(structure != nullptr);
+                mOut << "vertex __VERTEX_OUT(";
+                isVertexMain = true;
+            }
+            else
+            {
+                UNIMPLEMENTED();
+            }
         }
     }
     emitType(returnType, EmitTypeConfig());
     if (isVertexMain)
+    {
         mOut << ") ";
+    }
 }
 
 void GenMetalTraverser::emitFunctionParameter(const TFunction &func, const TVariable &param)
@@ -2156,6 +3466,11 @@ void GenMetalTraverser::emitFunctionParameter(const TFunction &func, const TVari
             {
                 mOut << " [[buffer(" << mUBOArgumentBufferBindingIndex << ")]]";
                 reflection->hasUBOs = true;
+            }
+            else if (mPipelineStructs.storageBuffers.matches(*structure))
+            {
+                mOut << " [[buffer(" << mSSBOArgumentBufferBindingIndex << ")]]";
+                reflection->hasSSBOs = true;
             }
             else if (mPipelineStructs.userUniforms.matches(*structure))
             {
@@ -2200,21 +3515,89 @@ void GenMetalTraverser::visitFunctionPrototype(TIntermFunctionPrototype *funcPro
     emitFunctionSignature(func);
 }
 
+void GenMetalTraverser::emitStorageBufferMatrixHelpers()
+{
+    if (mStorageBufferMatrixHelpersEmitted)
+    {
+        return;
+    }
+    mStorageBufferMatrixHelpersEmitted = true;
+
+    for (const auto &[parent, field] : mStorageBufferMatrixFields)
+    {
+        TType matrixType(*field->type());
+        matrixType.toArrayBaseType();
+        size_t majorCount;
+        size_t vectorSize;
+        size_t vectorStride;
+        bool isRowMajor;
+        GetStorageBufferMatrixLayout(matrixType, &majorCount, &vectorSize, &vectorStride,
+                                     &isRowMajor);
+        ASSERT(vectorStride > 0);
+
+        const std::string wrapperName = GetStorageBufferMatrixWrapperName(*parent, *field);
+        const std::string helperName  = wrapperName + "_load";
+        mOut << "inline ";
+        emitType(matrixType, {});
+        mOut << " " << helperName << "(" << wrapperName << " storage)\n{\n  ";
+        emitType(matrixType, {});
+        mOut << " value;\n";
+        for (size_t major = 0; major < majorCount; ++major)
+        {
+            for (size_t minor = 0; minor < vectorSize; ++minor)
+            {
+                const size_t column = isRowMajor ? minor : major;
+                const size_t row    = isRowMajor ? major : minor;
+                mOut << "  value[" << column << "][" << row << "] = storage."
+                     << (isRowMajor ? "row" : "column") << major << "[" << minor << "];\n";
+            }
+        }
+        mOut << "  return value;\n}\n";
+
+        const std::string storeName = wrapperName + "_store";
+        mOut << "inline void " << storeName << "(device " << wrapperName << " *destination, ";
+        emitType(matrixType, {});
+        mOut << " value)\n{\n";
+        for (size_t major = 0; major < majorCount; ++major)
+        {
+            mOut << "  (*destination)." << (isRowMajor ? "row" : "column") << major
+                 << " = metal::packed_float" << vectorSize << "(";
+            for (size_t minor = 0; minor < vectorSize; ++minor)
+            {
+                if (minor != 0)
+                {
+                    mOut << ", ";
+                }
+                const size_t column = isRowMajor ? minor : major;
+                const size_t row    = isRowMajor ? major : minor;
+                mOut << "value[" << column << "][" << row << "]";
+            }
+            mOut << ");\n";
+        }
+        mOut << "}\n\n";
+    }
+}
+
 bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition *funcDefNode)
 {
+    emitStorageBufferMatrixHelpers();
+
     const TFunction &func = *funcDefNode->getFunction();
     TIntermBlock &body    = *funcDefNode->getBody();
     if (func.isMain())
     {
         const TType &returnType     = func.getReturnType();
         const TStructure *structure = returnType.getStruct();
-        isTraversingVertexMain      = (mPipelineStructs.vertexOut.matches(*structure)) &&
-                                 mCompiler.getShaderType() == GL_VERTEX_SHADER;
+        isTraversingVertexMain      = mCompiler.getShaderType() == GL_VERTEX_SHADER && structure &&
+                                      mPipelineStructs.vertexOut.matches(*structure);
     }
     emitIndentation();
     emitFunctionSignature(func);
     mOut << "\n";
+    mIsComputeMain         = func.isMain() && mCompiler.getShaderType() == GL_COMPUTE_SHADER;
+    mInjectSharedVariables = mIsComputeMain;
     body.traverse(this);
+    mIsComputeMain = false;
     if (isTraversingVertexMain)
     {
         isTraversingVertexMain = false;
@@ -2263,6 +3646,9 @@ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
     putAngle("textureProjLodOffset");
     putAngle("textureProjOffset");
     putAngle("textureSize");
+    putAngle("textureGather");
+    putAngle("textureGatherOffset");
+    putAngle("imageSize");
     putAngle("imageLoad");
     putAngle("imageStore");
     putAngle("memoryBarrierImage");
@@ -2270,11 +3656,55 @@ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
     return map;
 }
 
+static const TIntermSymbol *GetRootSymbol(TIntermNode *node)
+{
+    while (node)
+    {
+        if (TIntermBinary *binary = node->getAsBinaryNode())
+        {
+            node = binary->getLeft();
+        }
+        else if (TIntermSwizzle *swizzle = node->getAsSwizzleNode())
+        {
+            node = swizzle->getOperand();
+        }
+        else if (TIntermAggregate *aggregate = node->getAsAggregate())
+        {
+            const TIntermSymbol *firstSymbol = nullptr;
+            for (TIntermNode *child : *aggregate->getSequence())
+            {
+                const TIntermSymbol *candidate = GetRootSymbol(child);
+                if (!candidate)
+                {
+                    continue;
+                }
+
+                const TQualifier qualifier = candidate->variable().getType().getQualifier();
+                if (qualifier == TQualifier::EvqBuffer || qualifier == TQualifier::EvqShared)
+                {
+                    return candidate;
+                }
+                if (!firstSymbol)
+                {
+                    firstSymbol = candidate;
+                }
+            }
+            return firstSymbol;
+        }
+        else
+        {
+            break;
+        }
+    }
+    return node ? node->getAsSymbolNode() : nullptr;
+}
+
 bool GenMetalTraverser::visitAggregate(Visit, TIntermAggregate *aggregateNode)
 {
     const TIntermSequence &args = *aggregateNode->getSequence();
 
-    auto emitArgList = [&](const char *open, const char *close) {
+    auto emitArgList = [&](const char *open, const char *close,
+                           bool appendSharedVariables = false) {
         mOut << open;
 
         bool emitComma = false;
@@ -2287,6 +3717,38 @@ bool GenMetalTraverser::visitAggregate(Visit, TIntermAggregate *aggregateNode)
             }
             emitComma = true;
             arg->traverse(this);
+        }
+
+        if (appendSharedVariables)
+        {
+            for (const TVariable *sharedVariable : mSharedVariables)
+            {
+                if (emitComma)
+                {
+                    mOut << ", ";
+                }
+                emitComma = true;
+                if (mIsComputeMain)
+                {
+                    mOut << "&";
+                }
+                emitNameOf(*sharedVariable);
+            }
+
+            if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+            {
+                for (const char *builtin :
+                     {"ANGLE_globalInvocationID", "ANGLE_localInvocationID",
+                      "ANGLE_localInvocationIndex", "ANGLE_workGroupID", "ANGLE_numWorkGroups"})
+                {
+                    if (emitComma)
+                    {
+                        mOut << ", ";
+                    }
+                    emitComma = true;
+                    mOut << builtin;
+                }
+            }
         }
 
         mOut << close;
@@ -2342,8 +3804,276 @@ bool GenMetalTraverser::visitAggregate(Visit, TIntermAggregate *aggregateNode)
     else
     {
         const TOperator op = aggregateNode->getOp();
+
+        const TType *imageArgType = nullptr;
+        if (!args.empty())
+        {
+            TIntermTyped *imageArg = args[0]->getAsTyped();
+            ASSERT(imageArg);
+            imageArgType = &imageArg->getType();
+        }
+        TIntermSymbol *imageArgSymbol = args.empty() ? nullptr : args[0]->getAsSymbolNode();
+        const bool isImageAtomic      = BuiltInGroup::IsImageAtomic(op);
+        const size_t expectedImageArgCount =
+            isImageAtomic
+                ? (op == TOperator::EOpImageAtomicCompSwap ? 4 : 3)
+                : (op == TOperator::EOpImageSize ? 1 : (op == TOperator::EOpImageLoad ? 2 : 3));
+
+        if (BuiltInGroup::IsTextureGather(op) && !BuiltInGroup::IsTextureGatherOffsets(op))
+        {
+            const TBasicType samplerType =
+                aggregateNode->getFunction()->getParam(0)->getType().getBasicType();
+            const bool isArray =
+                samplerType == EbtSampler2DArray || samplerType == EbtISampler2DArray ||
+                samplerType == EbtUSampler2DArray || samplerType == EbtSampler2DArrayShadow;
+            const bool isCube = samplerType == EbtSamplerCube || samplerType == EbtISamplerCube ||
+                                samplerType == EbtUSamplerCube ||
+                                samplerType == EbtSamplerCubeShadow;
+            const bool isShadow =
+                BuiltInGroup::IsTextureGatherRef(op) || BuiltInGroup::IsTextureGatherOffsetRef(op);
+            const bool hasOffset    = BuiltInGroup::IsTextureGatherOffset(op);
+            const bool hasComponent = BuiltInGroup::IsTextureGatherComp(op) ||
+                                      BuiltInGroup::IsTextureGatherOffsetComp(op);
+
+            mOut << "(";
+            args[0]->traverse(this);
+            mOut << ").texture->" << (isShadow ? "gather_compare" : "gather") << "(*( ";
+            args[0]->traverse(this);
+            mOut << ").sampler, ";
+
+            if (isArray)
+            {
+                mOut << "(";
+                args[1]->traverse(this);
+                mOut << ").xy, uint32_t(metal::round((";
+                args[1]->traverse(this);
+                mOut << ").z))";
+            }
+            else
+            {
+                args[1]->traverse(this);
+            }
+
+            if (isShadow)
+            {
+                mOut << ", ";
+                args[2]->traverse(this);
+                if (hasOffset)
+                {
+                    mOut << ", ";
+                    args[3]->traverse(this);
+                }
+            }
+            else
+            {
+                mOut << ", ";
+                if (!isCube)
+                {
+                    if (hasOffset)
+                    {
+                        args[2]->traverse(this);
+                    }
+                    else
+                    {
+                        mOut << "metal::int2(0)";
+                    }
+                    mOut << ", ";
+                }
+
+                const char *componentName = "x";
+                if (hasComponent)
+                {
+                    const TConstantUnion *componentValue =
+                        args[hasOffset ? 3 : 2]->getAsTyped()->getConstantValue();
+                    ASSERT(componentValue);
+                    switch (componentValue->getIConst())
+                    {
+                        case 0:
+                            componentName = "x";
+                            break;
+                        case 1:
+                            componentName = "y";
+                            break;
+                        case 2:
+                            componentName = "z";
+                            break;
+                        case 3:
+                            componentName = "w";
+                            break;
+                        default:
+                            UNREACHABLE();
+                    }
+                }
+                mOut << "metal::component::" << componentName;
+            }
+
+            mOut << ")";
+            return false;
+        }
+
+        if ((op == TOperator::EOpImageSize || op == TOperator::EOpImageLoad ||
+             op == TOperator::EOpImageStore || isImageAtomic) &&
+            imageArgType && IsImage2DType(imageArgType->getBasicType()) && !imageArgSymbol &&
+            args.size() == expectedImageArgCount + 1)
+        {
+            const char *functionName =
+                isImageAtomic ? GetImageAtomicFunctionName(op)
+                              : (op == TOperator::EOpImageSize
+                                     ? "ANGLE_imageSize"
+                                     : (op == TOperator::EOpImageLoad ? "ANGLE_imageLoad"
+                                                                      : "ANGLE_imageStore"));
+            mOut << functionName << "(";
+            args[0]->traverse(this);
+            mOut << ", ";
+            args[0]->traverse(this);
+            mOut << "_ANGLE_3D, ";
+            args.back()->traverse(this);
+            for (size_t argIndex = 1; argIndex < expectedImageArgCount; ++argIndex)
+            {
+                mOut << ", ";
+                args[argIndex]->traverse(this);
+            }
+            mOut << ")";
+            return false;
+        }
+
+        if (isImageAtomic)
+        {
+            mOut << GetImageAtomicFunctionName(op);
+            emitArgList("(", ")");
+            return false;
+        }
+
+        if (op == TOperator::EOpImageSize && imageArgType &&
+            IsImageCubeType(imageArgType->getBasicType()) &&
+            mCompileOptions.emulateR32fImageAtomicExchange)
+        {
+            mOut << "ANGLE_imageSize(";
+            args[0]->traverse(this);
+            mOut << ").xy";
+            return false;
+        }
+
         switch (op)
         {
+            case TOperator::EOpAtomicAdd:
+            case TOperator::EOpAtomicMin:
+            case TOperator::EOpAtomicMax:
+            case TOperator::EOpAtomicAnd:
+            case TOperator::EOpAtomicOr:
+            case TOperator::EOpAtomicXor:
+            case TOperator::EOpAtomicExchange:
+            case TOperator::EOpAtomicCompSwap:
+            {
+                const bool isCompareSwap = op == TOperator::EOpAtomicCompSwap;
+                ASSERT(args.size() == (isCompareSwap ? 3u : 2u));
+                TIntermTyped *memory = args[0]->getAsTyped();
+                ASSERT(memory);
+                const TIntermSymbol *rootSymbol = GetRootSymbol(args[0]);
+                ASSERT(rootSymbol);
+
+                const TQualifier qualifier = rootSymbol->variable().getType().getQualifier();
+                const char *addressSpace;
+                const char *atomicFunction;
+                switch (qualifier)
+                {
+                    case TQualifier::EvqShared:
+                        addressSpace = "threadgroup";
+                        break;
+                    case TQualifier::EvqBuffer:
+                        addressSpace = "device";
+                        break;
+                    default:
+                        UNIMPLEMENTED();
+                        addressSpace = "device";
+                        break;
+                }
+
+                switch (op)
+                {
+                    case TOperator::EOpAtomicAdd:
+                        atomicFunction = "metal::atomic_fetch_add_explicit";
+                        break;
+                    case TOperator::EOpAtomicMin:
+                        atomicFunction = "metal::atomic_fetch_min_explicit";
+                        break;
+                    case TOperator::EOpAtomicMax:
+                        atomicFunction = "metal::atomic_fetch_max_explicit";
+                        break;
+                    case TOperator::EOpAtomicAnd:
+                        atomicFunction = "metal::atomic_fetch_and_explicit";
+                        break;
+                    case TOperator::EOpAtomicOr:
+                        atomicFunction = "metal::atomic_fetch_or_explicit";
+                        break;
+                    case TOperator::EOpAtomicXor:
+                        atomicFunction = "metal::atomic_fetch_xor_explicit";
+                        break;
+                    case TOperator::EOpAtomicExchange:
+                        atomicFunction = "metal::atomic_exchange_explicit";
+                        break;
+                    case TOperator::EOpAtomicCompSwap:
+                        atomicFunction = "ANGLE_atomicCompSwap";
+                        break;
+                    default:
+                        UNREACHABLE();
+                        atomicFunction = "";
+                        break;
+                }
+
+                const char *atomicType =
+                    memory->getType().isSignedInt() ? "metal::atomic_int" : "metal::atomic_uint";
+                auto emitAtomicMemoryPointer = [&]() {
+                    TIntermAggregate *memoryReference = args[0]->getAsAggregate();
+                    const TFunction *referenceFunction =
+                        memoryReference ? memoryReference->getFunction() : nullptr;
+                    const bool isElementReference =
+                        referenceFunction && referenceFunction->name() == "elem_ref";
+                    const bool isSwizzleReference =
+                        referenceFunction && referenceFunction->name() == "swizzle_ref";
+                    if (!isElementReference && !isSwizzleReference)
+                    {
+                        mOut << "reinterpret_cast<" << addressSpace << " " << atomicType << " *>(&";
+                        args[0]->traverse(this);
+                        mOut << ")";
+                        return;
+                    }
+
+                    const TIntermSequence &referenceArgs = *memoryReference->getSequence();
+                    ASSERT(referenceArgs.size() == 2);
+                    TIntermTyped *vector = referenceArgs[0]->getAsTyped();
+                    ASSERT(vector && vector->getType().isVector());
+                    mOut << "(reinterpret_cast<" << addressSpace << " " << atomicType << " *>(&";
+                    referenceArgs[0]->traverse(this);
+                    mOut << ") + ";
+                    if (isElementReference)
+                    {
+                        mOut << "metal::clamp(int(";
+                    }
+                    referenceArgs[1]->traverse(this);
+                    if (isElementReference)
+                    {
+                        mOut << "), 0, " << vector->getType().getNominalSize() - 1 << ")";
+                    }
+                    mOut << ")";
+                };
+                mOut << atomicFunction << "(";
+                emitAtomicMemoryPointer();
+                mOut << ", ";
+                args[1]->traverse(this);
+                if (isCompareSwap)
+                {
+                    mOut << ", ";
+                    args[2]->traverse(this);
+                }
+                else
+                {
+                    mOut << ", metal::memory_order_relaxed";
+                }
+                mOut << ")";
+                return false;
+            }
+
             case TOperator::EOpCallFunctionInAST:
             case TOperator::EOpCallInternalRawFunction:
             {
@@ -2352,7 +4082,7 @@ bool GenMetalTraverser::visitAggregate(Visit, TIntermAggregate *aggregateNode)
                 //'@' symbol in name specifices a macro substitution marker.
                 if (!func.name().contains("@"))
                 {
-                    emitArgList("(", ")");
+                    emitArgList("(", ")", func.symbolType() == SymbolType::UserDefined);
                 }
                 else
                 {
@@ -2517,6 +4247,19 @@ bool GenMetalTraverser::visitBlock(Visit, TIntermBlock *blockNode)
     else
     {
         emitOpenBrace();
+        if (mInjectSharedVariables)
+        {
+            mInjectSharedVariables = false;
+            for (const TVariable *sharedVariable : mSharedVariables)
+            {
+                emitIndentation();
+                EmitVariableDeclarationConfig evdConfig;
+                evdConfig.disableStructSpecifier = true;
+                evdConfig.storageAddressSpace    = &kThreadgroupAddressSpace;
+                emitVariableDeclaration(VarDecl(*sharedVariable), evdConfig);
+                mOut << ";\n";
+            }
+        }
         if (parentIsSwitch)
         {
             ++mIndentLevel;
@@ -2583,6 +4326,11 @@ bool GenMetalTraverser::visitDeclaration(Visit, TIntermDeclaration *declNode)
     if (TIntermSymbol *symbolNode = node.getAsSymbolNode())
     {
         const TVariable &var = symbolNode->variable();
+        if (var.getType().getQualifier() == TQualifier::EvqShared)
+        {
+            mSharedVariables.push_back(&var);
+            return false;
+        }
         emitVariableDeclaration(VarDecl(var), evdConfig);
         if (var.getType().isArray() && var.getType().getQualifier() == EvqTemporary)
         {

@@ -260,13 +260,6 @@ class CollectVariablesTraverser : public TIntermTraverser
     bool mPrimitiveIDAdded;
     bool mLayerAdded;
 
-    // Shared memory variables
-    // TODO(http://anglebug.com/349994211): This is incorrect, there can be multiple shared
-    // variables and this bool prevents all but the first from getting collected.  The only side
-    // effect is that validation of shared memory size against GL_MAX_COMPUTE_SHARED_MEMORY_SIZE
-    // cannot be correctly done.
-    bool mSharedVariableAdded;
-
     // Tessellation Shader builtins
     bool mPatchVerticesInAdded;
     bool mTessLevelOuterAdded;
@@ -345,7 +338,6 @@ CollectVariablesTraverser::CollectVariablesTraverser(
       mInvocationIDAdded(false),
       mPrimitiveIDAdded(false),
       mLayerAdded(false),
-      mSharedVariableAdded(false),
       mPatchVerticesInAdded(false),
       mTessLevelOuterAdded(false),
       mTessLevelInnerAdded(false),
@@ -672,10 +664,13 @@ void CollectVariablesTraverser::visitSymbol(TIntermSymbol *symbol)
                 recordBuiltInVaryingUsed(symbol->variable(), &mLayerAdded, mInputVaryings);
                 break;
             case EvqShared:
-                if (mShaderType == GL_COMPUTE_SHADER)
+                if (mShaderType == GL_COMPUTE_SHADER &&
+                    FindVariable(symbol->variable().name(), mSharedVariables) == nullptr)
                 {
-                    recordBuiltInVaryingUsed(symbol->variable(), &mSharedVariableAdded,
-                                             mSharedVariables);
+                    ShaderVariable info;
+                    setBuiltInInfoFromSymbol(symbol->variable(), &info);
+                    info.active = true;
+                    mSharedVariables->push_back(std::move(info));
                 }
                 break;
             case EvqClipDistance:

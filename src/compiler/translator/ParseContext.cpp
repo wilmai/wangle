@@ -895,7 +895,10 @@ TParseContext::TParseContext(TSymbolTable &symt,
       mDefaultUniformMatrixPacking(EmpColumnMajor),
       mDefaultUniformBlockStorage(sh::IsWebGLBasedSpec(spec) ? EbsStd140 : EbsShared),
       mDefaultBufferMatrixPacking(EmpColumnMajor),
-      mDefaultBufferBlockStorage(sh::IsWebGLBasedSpec(spec) ? EbsStd140 : EbsShared),
+      mDefaultBufferBlockStorage(
+          sh::IsWebGLBasedSpec(spec)
+              ? EbsStd140
+              : (outputType == SH_MSL_METAL_OUTPUT ? EbsStd430 : EbsShared)),
       mDiagnostics(diagnostics),
       mDirectiveHandler(ext, *mDiagnostics, *this, mShaderType),
       mPreprocessor(mDiagnostics,
@@ -7363,6 +7366,13 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
                     "extraneous layout qualifier: only has an effect on matrix types",
                     getMatrixPackingString(fieldLayoutQualifier.matrixPacking));
             fieldLayoutQualifier.matrixPacking = EmpUnspecified;
+        }
+
+        if (typeQualifier.qualifier == EvqBuffer)
+        {
+            // Preserve the storage-block layout on each member so the MSL writer can represent
+            // std430 vec3 members with their 12-byte payload and 16-byte alignment.
+            fieldLayoutQualifier.blockStorage = blockLayoutQualifier.blockStorage;
         }
 
         fieldType->setLayoutQualifier(fieldLayoutQualifier);

@@ -94,6 +94,8 @@ struct ProgramShaderObjVariantMtl
     // UBO's argument buffer encoder. Used when number of UBOs used exceeds number of allowed
     // discrete slots, and thus needs to encode all into one argument buffer.
     ProgramArgumentBufferEncoderMtl uboArgBufferEncoder;
+    // SSBO argument buffer encoder for this shader stage.
+    ProgramArgumentBufferEncoderMtl ssboArgBufferEncoder;
 
     // Store reference to the TranslatedShaderInfo to easy querying mapped textures/UBO/XFB
     // bindings.
@@ -178,7 +180,7 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
     void getUniformiv(const gl::Context *context, GLint location, GLint *params) const override;
     void getUniformuiv(const gl::Context *context, GLint location, GLuint *params) const override;
 
-    bool hasFlatAttribute() const { return mProgramHasFlatAttributes; }
+    bool hasFlatAttribute() const;
 
     // Calls this before drawing, changedPipelineDesc is passed when vertex attributes desc and/or
     // shader program changed.
@@ -189,10 +191,21 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
                             bool forceTexturesSetting,
                             bool uniformBuffersDirty);
 
+    angle::Result setupCompute(const gl::Context *glContext,
+                               mtl::ComputeCommandEncoder *cmdEncoder);
+
   private:
     friend class ProgramMtl;
 
     void reset(ContextMtl *context);
+
+    angle::Result setupDrawFromProgramPipeline(const gl::Context *glContext,
+                                               ContextMtl *context,
+                                               mtl::RenderCommandEncoder *cmdEncoder,
+                                               const mtl::RenderPipelineDesc &pipelineDesc,
+                                               bool pipelineDescChanged,
+                                               bool forceTexturesSetting,
+                                               bool uniformBuffersDirty);
 
     template <int cols, int rows>
     void setUniformMatrixfv(GLint location,
@@ -235,6 +248,13 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
                                        id<MTLFunction> *shaderOut);
 
     angle::Result commitUniforms(ContextMtl *context, mtl::RenderCommandEncoder *cmdEncoder);
+    angle::Result commitComputeUniforms(ContextMtl *context,
+                                        mtl::ComputeCommandEncoder *cmdEncoder);
+    angle::Result updateComputeUniformBuffers(ContextMtl *context,
+                                              mtl::ComputeCommandEncoder *cmdEncoder);
+    angle::Result encodeComputeUniformBuffersInfoArgumentBuffer(
+        ContextMtl *context,
+        mtl::ComputeCommandEncoder *cmdEncoder);
     angle::Result updateTextures(const gl::Context *glContext,
                                  mtl::RenderCommandEncoder *cmdEncoder,
                                  bool forceUpdate);
@@ -253,6 +273,10 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
     angle::Result encodeUniformBuffersInfoArgumentBuffer(ContextMtl *context,
                                                          mtl::RenderCommandEncoder *cmdEncoder,
                                                          gl::ShaderType shaderType);
+    template <typename CommandEncoder>
+    angle::Result updateStorageBuffers(ContextMtl *context,
+                                       CommandEncoder *cmdEncoder,
+                                       gl::ShaderType shaderType);
 
     bool mProgramHasFlatAttributes;
 
@@ -267,13 +291,18 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
     // (gl_Position). Need a special version of vertex shader that only writes to transform feedback
     // buffers.
     mtl::TranslatedShaderInfo mMslXfbOnlyVertexShaderInfo;
+    // Rasterizing vertex shader that reuses the output captured by the XFB-only pass.
+    mtl::TranslatedShaderInfo mMslXfbReplayVertexShaderInfo;
 
     // Compiled native shader object variants:
     // - Vertex shader: One with emulated rasterization discard, one with true rasterization
     // discard, one without.
     mtl::RenderPipelineRasterStateMap<ProgramShaderObjVariantMtl> mVertexShaderVariants;
+    ProgramShaderObjVariantMtl mXfbReplayVertexShaderVariant;
     // - Fragment shader: Combinations of sample coverage mask and depth write enabled states.
     std::array<ProgramShaderObjVariantMtl, kFragmentShaderVariants> mFragmentShaderVariants;
+    // - Compute shader: one monolithic kernel variant per program.
+    ProgramShaderObjVariantMtl mComputeShaderVariant;
 
     // Cached references of current shader variants.
     gl::ShaderMap<ProgramShaderObjVariantMtl *> mCurrentShaderVariants;

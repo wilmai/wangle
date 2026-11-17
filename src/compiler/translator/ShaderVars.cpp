@@ -8,6 +8,7 @@
 //
 
 #include <GLSLANG/ShaderLang.h>
+#include <limits>
 #include "common/unsafe_buffers.h"
 
 #include "common/debug.h"
@@ -221,14 +222,20 @@ unsigned int ShaderVariable::getBasicTypeElementCount() const
 
 unsigned int ShaderVariable::getExternalSize() const
 {
-    unsigned int memorySize = 0;
+    constexpr unsigned int kMaxSize = std::numeric_limits<unsigned int>::max();
+    unsigned int memorySize        = 0;
 
     if (isStruct())
     {
         // Have a structure, need to compute the structure size.
         for (const auto &field : fields)
         {
-            memorySize += field.getExternalSize();
+            const unsigned int fieldSize = field.getExternalSize();
+            if (fieldSize > kMaxSize - memorySize)
+            {
+                return kMaxSize;
+            }
+            memorySize += fieldSize;
         }
     }
     else
@@ -236,8 +243,16 @@ unsigned int ShaderVariable::getExternalSize() const
         memorySize += gl::VariableExternalSize(type);
     }
 
-    // multiply by array size to get total memory size of this variable / struct.
-    memorySize *= getArraySizeProduct();
+    // Multiply by each array dimension, saturating so a large declared shared array cannot wrap
+    // below GL_MAX_COMPUTE_SHARED_MEMORY_SIZE.
+    for (unsigned int arraySize : arraySizes)
+    {
+        if (arraySize != 0 && memorySize > kMaxSize / arraySize)
+        {
+            return kMaxSize;
+        }
+        memorySize *= arraySize;
+    }
 
     return memorySize;
 }

@@ -20,6 +20,12 @@ struct FeaturesMtl : FeatureSetBase
     FeaturesMtl();
     ~FeaturesMtl();
 
+    FeatureInfo enableExperimentalGles31 = {
+        "enableExperimentalGles31",
+        FeatureCategory::MetalFeatures,
+        &members,
+    };
+
     FeatureInfo hasBaseVertexInstancedDraw = {
         "hasBaseVertexInstancedDraw",
         FeatureCategory::MetalFeatures,

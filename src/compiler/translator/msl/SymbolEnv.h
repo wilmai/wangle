@@ -22,6 +22,7 @@ enum class AddressSpace
     Constant,
     Device,
     Thread,
+    Threadgroup,
 };
 
 char const *toString(AddressSpace space);

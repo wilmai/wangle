@@ -1547,6 +1547,9 @@ angle::Result Texture::setImage(Context *context,
 
     ANGLE_TRY(handleMipmapGenerationHint(context, level));
 
+    // Some backends defer recreating native storage after an image is redefined. Make sure the
+    // backend syncs the new image description before the texture is used again.
+    signalDirtyState(DIRTY_BIT_IMPLEMENTATION);
     signalDirtyStorage(initState);
 
     return angle::Result::Continue;
@@ -1605,6 +1608,7 @@ angle::Result Texture::setCompressedImage(Context *context,
 
     InitState initState = DetermineInitState(context, unpackBuffer, pixels);
     mState.setImageDesc(target, level, ImageDesc(size, Format(internalFormat), initState));
+    signalDirtyState(DIRTY_BIT_IMPLEMENTATION);
     signalDirtyStorage(initState);
 
     return angle::Result::Continue;
@@ -1723,6 +1727,7 @@ angle::Result Texture::copyImage(Context *context,
     ANGLE_TRY(handleMipmapGenerationHint(context, level));
 
     // Because this could affect the texture storage we might need to init other layers/levels.
+    signalDirtyState(DIRTY_BIT_IMPLEMENTATION);
     signalDirtyStorage(initState);
 
     return angle::Result::Continue;
@@ -1855,6 +1860,7 @@ angle::Result Texture::copyTexture(Context *context,
         target, level,
         ImageDesc(sourceDesc.size, Format(internalFormatInfo), InitState::Initialized));
 
+    signalDirtyState(DIRTY_BIT_IMPLEMENTATION);
     signalDirtyStorage(InitState::Initialized);
 
     return angle::Result::Continue;
@@ -1906,6 +1912,7 @@ angle::Result Texture::copyCompressedTexture(Context *context, const Texture *so
     const auto &sourceDesc =
         source->mState.getImageDesc(NonCubeTextureTypeToTarget(source->getType()), 0);
     mState.setImageDesc(NonCubeTextureTypeToTarget(getType()), 0, sourceDesc);
+    signalDirtyState(DIRTY_BIT_IMPLEMENTATION);
 
     return angle::Result::Continue;
 }

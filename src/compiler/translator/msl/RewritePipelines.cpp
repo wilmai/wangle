@@ -296,6 +296,18 @@ class GeneratePipelineStruct : private TIntermRebuild
                 }
             }
             break;
+            case Pipeline::Type::StorageBuffer:
+            {
+                for (const TVariable *var : mPipelineVariableList)
+                {
+                    auto &type  = CloneType(var->getType());
+                    auto *field = new TField(&type, var->name(), kNoSourceLoc, var->symbolType());
+                    mSymbolEnv.markAsPointer(*field, AddressSpace::Device);
+                    mSymbolEnv.markAsPointer(*var, AddressSpace::Device);
+                    fields.push_back(field);
+                }
+            }
+            break;
             default:
             {
                 for (const TVariable *var : mPipelineVariableList)
@@ -807,6 +819,20 @@ class UpdatePipelineFunctions : private TIntermRebuild
             }
         };
 
+        auto appendTransformFeedbackReplayOutput = [&](TIntermBlock &body) {
+            if (mPipeline.type == Pipeline::Type::VertexOut)
+            {
+                // The replay buffer has the type of main's return value.  When the output
+                // pipeline is split, main returns the modified struct; otherwise it returns the
+                // original struct.
+                const char *marker = mPipelineMainLocalVar.isUniform()
+                                         ? "@@XFB-REPLAY-OUT@@"
+                                         : "@@XFB-REPLAY-OUT-MODIFIED@@";
+                body.appendStatement(&mSymbolEnv.callFunctionOverload(Name(marker), *new TType(),
+                                                                      *new TIntermSequence()));
+            }
+        };
+
         TIntermBlock *body = funcDefNode.getBody();
 
         if (mPipeline.alwaysRequiresLocalVariableDeclarationInMain())
@@ -872,24 +898,29 @@ class UpdatePipelineFunctions : private TIntermRebuild
                     const TVariable &textureParam = *func.getParam(paramIndex++);
                     const TVariable &samplerParam = *func.getParam(paramIndex++);
 
-                    auto go = [&](TIntermTyped &env, const int *index) {
-                        TIntermTyped &textureField =
-                            AccessField(AccessIndex(*env.deepCopy(), index),
-                                        Name("texture", SymbolType::BuiltIn));
-                        TIntermTyped &samplerField =
-                            AccessField(AccessIndex(*env.deepCopy(), index),
-                                        Name("sampler", SymbolType::BuiltIn));
+                    auto go = [&](TIntermTyped &envElement, const int *index) {
+                        const TStructure *textureEnv = envElement.getType().getStruct();
+                        ASSERT(textureEnv && textureEnv->fields().size() == 2);
 
-                        auto mkAssign = [&](TIntermTyped &field, const TVariable &param) {
-                            return new TIntermBinary(TOperator::EOpAssign, &field,
-                                                     &mSymbolEnv.callFunctionOverload(
-                                                         Name("addressof"), field.getType(),
-                                                         *new TIntermSequence{&AccessIndex(
-                                                             *new TIntermSymbol(&param), index)}));
+                        auto addressOfParam = [&](const TVariable &param, const TField &field) {
+                            TIntermTyped *value = new TIntermSymbol(&param);
+                            if (index)
+                            {
+                                value = &AccessIndex(*value, index);
+                            }
+                            return &mSymbolEnv.callFunctionOverload(
+                                Name("addressof"), *field.type(), *new TIntermSequence{value});
                         };
 
-                        newBody->appendStatement(mkAssign(textureField, textureParam));
-                        newBody->appendStatement(mkAssign(samplerField, samplerParam));
+                        TIntermSequence textureEnvArgs{
+                            addressOfParam(textureParam, *textureEnv->fields()[0]),
+                            addressOfParam(samplerParam, *textureEnv->fields()[1]),
+                        };
+                        TType textureEnvType(textureEnv, false);
+                        auto *textureEnvValue =
+                            TIntermAggregate::CreateConstructor(textureEnvType, &textureEnvArgs);
+                        newBody->appendStatement(
+                            new TIntermBinary(TOperator::EOpAssign, &envElement, textureEnvValue));
                     };
 
                     TIntermTyped &env = AccessField(*mPipelineMainLocalVar.internal, Name(*field));
@@ -901,7 +932,8 @@ class UpdatePipelineFunctions : private TIntermRebuild
                         const auto n = static_cast<int>(envType.getArraySizeProduct());
                         for (int i = 0; i < n; ++i)
                         {
-                            go(env, &i);
+                            TIntermTyped &envElement = AccessIndex(*env.deepCopy(), &i);
+                            go(envElement, &i);
                         }
                     }
                     else
@@ -935,6 +967,8 @@ class UpdatePipelineFunctions : private TIntermRebuild
                 callOriginalToModified(*newBody);
             }
 
+            appendTransformFeedbackReplayOutput(*newBody);
+
             if (mPipeline.isPipelineOut())
             {
                 newBody->appendStatement(new TIntermBranch(
@@ -953,6 +987,7 @@ class UpdatePipelineFunctions : private TIntermRebuild
             callModifiedToOriginal(*newBody);
             newBody->appendStatement(body);
             callOriginalToModified(*newBody);
+            appendTransformFeedbackReplayOutput(*newBody);
             body = newBody;
         }
 
@@ -966,6 +1001,8 @@ bool UpdatePipelineSymbols(Pipeline::Type pipelineType,
                            TCompiler &compiler,
                            TIntermBlock &root,
                            SymbolEnv &symbolEnv,
+                           const TVariable *globalInstanceVar,
+                           const PipelineScoped<TStructure> &pipelineStruct,
                            const VariableSet &pipelineVariables,
                            PipelineScoped<TVariable> pipelineMainLocalVar)
 {
@@ -977,8 +1014,44 @@ bool UpdatePipelineSymbols(Pipeline::Type pipelineType,
         {
             return symbol;
         }
+        if (&var == globalInstanceVar)
+        {
+            // Global pipeline instances are threaded as a structure parameter.  Their references
+            // must use that parameter directly instead of retaining a reference to the removed
+            // global variable or selecting a field named after the instance.
+            ASSERT(owner);
+            ASSERT(owner->getParamCount() > 0);
+            return *new TIntermSymbol(owner->getParam(0));
+        }
         const TVariable *structInstanceVar;
-        if (owner->isMain() && pipelineType != Pipeline::Type::FragmentIn)
+        if (owner->isMain() && compiler.getShaderType() == GL_COMPUTE_SHADER &&
+            pipelineType == Pipeline::Type::Texture)
+        {
+            // Compute textures are passed as separate Metal texture and sampler arguments, then
+            // assembled into the TextureEnv local in main before shader code runs.
+            ASSERT(pipelineMainLocalVar.internal);
+            structInstanceVar = pipelineMainLocalVar.internal;
+        }
+        else if (owner->isMain() && compiler.getShaderType() == GL_COMPUTE_SHADER)
+        {
+            // Compute pipeline structs are passed directly as kernel arguments rather than being
+            // copied through main-local variables. Other pipeline rewrites may already have
+            // inserted kernel arguments, so find this pipeline's argument by its struct type.
+            ASSERT(pipelineStruct.internal);
+            const TStructure *expectedStruct = pipelineStruct.internal;
+            structInstanceVar = nullptr;
+            for (size_t paramIndex = 0; paramIndex < owner->getParamCount(); ++paramIndex)
+            {
+                const TVariable *param = owner->getParam(paramIndex);
+                if (param->getType().getStruct() == expectedStruct)
+                {
+                    structInstanceVar = param;
+                    break;
+                }
+            }
+            ASSERT(structInstanceVar);
+        }
+        else if (owner->isMain() && pipelineType != Pipeline::Type::FragmentIn)
         {
             ASSERT(pipelineMainLocalVar.internal);
             structInstanceVar = pipelineMainLocalVar.internal;
@@ -1014,7 +1087,6 @@ bool RewritePipeline(TCompiler &compiler,
     {
         return false;
     }
-
     if (psi.isEmpty())
     {
         return true;
@@ -1033,21 +1105,18 @@ bool RewritePipeline(TCompiler &compiler,
     {
         return false;
     }
-
-    if (!pipeline.globalInstanceVar)
+    if (!UpdatePipelineSymbols(pipeline.type, compiler, root, symbolEnv,
+                               pipeline.globalInstanceVar, psi.pipelineStruct,
+                               psi.pipelineVariables,
+                               pipelineMainLocalVar))
     {
-        if (!UpdatePipelineSymbols(pipeline.type, compiler, root, symbolEnv, psi.pipelineVariables,
-                                   pipelineMainLocalVar))
-        {
-            return false;
-        }
+        return false;
     }
 
     if (!PruneNoOps(&compiler, &root, &compiler.getSymbolTable()))
     {
         return false;
     }
-
     outStruct = psi.pipelineStruct;
     return true;
 }
@@ -1073,8 +1142,8 @@ bool sh::RewritePipelines(TCompiler &compiler,
 
     Info infos[] = {
         {Pipeline::Type::InstanceId, outStructs.instanceId, nullptr, nullptr},
-        {Pipeline::Type::Texture, outStructs.image, nullptr, nullptr},
-        {Pipeline::Type::Image, outStructs.texture, nullptr, nullptr},
+        {Pipeline::Type::Texture, outStructs.texture, nullptr, nullptr},
+        {Pipeline::Type::Image, outStructs.image, nullptr, nullptr},
         {Pipeline::Type::NonConstantGlobals, outStructs.nonConstantGlobals, nullptr, nullptr},
         {Pipeline::Type::AngleUniforms, outStructs.angleUniforms,
          angleUniformsGlobalInstanceVar.getDriverUniformsVariable(), nullptr},
@@ -1088,10 +1157,27 @@ bool sh::RewritePipelines(TCompiler &compiler,
         {Pipeline::Type::InvocationFragmentGlobals, outStructs.invocationFragmentGlobals, nullptr,
          &inputVaryings},
         {Pipeline::Type::UniformBuffer, outStructs.uniformBuffers, nullptr, nullptr},
+        {Pipeline::Type::StorageBuffer, outStructs.storageBuffers, nullptr, nullptr},
     };
 
     for (Info &info : infos)
     {
+        // Compute shaders usually have no driver-uniform block.  Atomic-counter emulation adds
+        // the compute-specific acbBufferOffsets field, which still needs an argument in the
+        // kernel entry point.
+        const bool hasComputeDriverUniforms =
+            compiler.getShaderType() == GL_COMPUTE_SHADER &&
+            info.pipelineType == Pipeline::Type::AngleUniforms && info.globalInstanceVar;
+        if (compiler.getShaderType() == GL_COMPUTE_SHADER &&
+            info.pipelineType != Pipeline::Type::UserUniforms &&
+            info.pipelineType != Pipeline::Type::Texture &&
+            info.pipelineType != Pipeline::Type::Image &&
+            info.pipelineType != Pipeline::Type::UniformBuffer &&
+            info.pipelineType != Pipeline::Type::StorageBuffer && !hasComputeDriverUniforms)
+        {
+            continue;
+        }
+
         if ((compiler.getShaderType() != GL_VERTEX_SHADER &&
              (info.pipelineType == Pipeline::Type::VertexIn ||
               info.pipelineType == Pipeline::Type::VertexOut ||
@@ -1100,7 +1186,9 @@ bool sh::RewritePipelines(TCompiler &compiler,
              (info.pipelineType == Pipeline::Type::FragmentIn ||
               info.pipelineType == Pipeline::Type::FragmentOut ||
               info.pipelineType == Pipeline::Type::InvocationFragmentGlobals)))
+        {
             continue;
+        }
 
         Pipeline pipeline{info.pipelineType, info.globalInstanceVar};
         if (!RewritePipeline(compiler, root, idGen, pipeline, symbolEnv, info.variableInfo,

@@ -22,14 +22,51 @@ namespace rx
 {
 namespace
 {
-constexpr char kXfbBindingsMarker[]     = "@@XFB-Bindings@@";
-constexpr char kXfbOutMarker[]          = "ANGLE_@@XFB-OUT@@";
-constexpr char kUserDefinedNamePrefix[] = "_u";  // Defined in GLSLANG/ShaderLang.h
-constexpr char kAttribBindingsMarker[]  = "@@Attrib-Bindings@@\n";
+constexpr char kXfbBindingsMarker[]          = "@@XFB-Bindings@@";
+constexpr char kXfbOutMarker[]               = "ANGLE_@@XFB-OUT@@";
+constexpr char kXfbReplayMarker[]            = "ANGLE_@@XFB-REPLAY@@";
+constexpr char kXfbReplayOutMarker[]         = "ANGLE_@@XFB-REPLAY-OUT@@";
+constexpr char kXfbReplayOutModifiedMarker[] = "ANGLE_@@XFB-REPLAY-OUT-MODIFIED@@";
+constexpr char kUserDefinedNamePrefix[]      = "_u";  // Defined in GLSLANG/ShaderLang.h
+constexpr char kAttribBindingsMarker[]       = "@@Attrib-Bindings@@\n";
 
 std::string GetXfbBufferNameMtl(const uint32_t bufferIndex)
 {
     return "xfbBuffer" + Str(bufferIndex);
+}
+
+const std::vector<sh::RWTextureBinding> &GetImageUniformTextureBindings(
+    const sh::TranslatorMetalReflection &reflection,
+    const std::string &uniformName,
+    const std::string &uniformMappedName)
+{
+    for (const std::string *candidate : {&uniformName, &uniformMappedName})
+    {
+        std::string name = *candidate;
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            const auto &bindings = reflection.getRWTextureBindings(name);
+            if (!bindings.empty())
+            {
+                return bindings;
+            }
+
+            if (name.size() >= 3 && name.compare(name.size() - 3, 3, "[0]") == 0)
+            {
+                name.resize(name.size() - 3);
+            }
+            else if (name.size() >= 2 && name.compare(0, 2, "_u") == 0)
+            {
+                name.erase(0, 2);
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+
+    return reflection.getRWTextureBindings("");
 }
 
 // Name format needs to match sh::Name.
@@ -138,21 +175,27 @@ namespace mtl
 
 void TranslatedShaderInfo::reset()
 {
-    metalShaderSource    = nullptr;
-    metalLibrary         = nil;
-    hasUBOArgumentBuffer = false;
-    hasIsnanOrIsinf      = false;
-    hasInvariant         = false;
+    metalShaderSource     = nullptr;
+    metalLibrary          = nil;
+    hasUBOArgumentBuffer  = false;
+    hasSSBOArgumentBuffer = false;
+    hasIsnanOrIsinf       = false;
+    hasInvariant          = false;
     for (mtl::SamplerBinding &binding : actualSamplerBindings)
     {
         binding.textureBinding = mtl::kMaxShaderSamplers;
         binding.samplerBinding = 0;
     }
-    for (int &rwTextureBinding : actualImageBindings)
+    for (auto &imageBindings : actualImageBindings)
     {
-        rwTextureBinding = -1;
+        imageBindings.clear();
     }
     for (uint32_t &binding : actualUBOBindings)
+    {
+        binding = mtl::kMaxShaderBuffers;
+    }
+
+    for (uint32_t &binding : actualStorageBufferBindings)
     {
         binding = mtl::kMaxShaderBuffers;
     }
@@ -443,7 +486,10 @@ std::string UpdateFragmentShaderOutputs(std::string shaderSourceIn,
 
 std::string SubstituteTransformFeedbackMarkers(const std::string &originalSource,
                                                const std::string &xfbBindings,
-                                               const std::string &xfbOut)
+                                               const std::string &xfbOut,
+                                               const std::string &xfbReplayInput,
+                                               const std::string &xfbReplayOutput,
+                                               const std::string &xfbReplayOutputModified)
 {
     const size_t xfbBindingsMarkerStart = originalSource.find(kXfbBindingsMarker);
     bool hasBindingsMarker              = xfbBindingsMarkerStart != std::string::npos;
@@ -473,9 +519,32 @@ std::string SubstituteTransformFeedbackMarkers(const std::string &originalSource
                       xfbOutMarkerStart - xfbBindingsMarkerEnd);
         result.append(xfbOut);
         result.append(originalSource, xfbOutMarkerEnd);
-        return result;
     }
-    return originalSource;
+    else
+    {
+        result = originalSource;
+    }
+
+    const size_t replayMarkerStart = result.find(kXfbReplayMarker);
+    if (replayMarkerStart != std::string::npos)
+    {
+        result.replace(replayMarkerStart, angle::ConstStrLen(kXfbReplayMarker), xfbReplayInput);
+    }
+
+    const size_t replayOutMarkerStart = result.find(kXfbReplayOutMarker);
+    if (replayOutMarkerStart != std::string::npos)
+    {
+        result.replace(replayOutMarkerStart, angle::ConstStrLen(kXfbReplayOutMarker),
+                       xfbReplayOutput);
+    }
+
+    const size_t replayOutModifiedMarkerStart = result.find(kXfbReplayOutModifiedMarker);
+    if (replayOutModifiedMarkerStart != std::string::npos)
+    {
+        result.replace(replayOutModifiedMarkerStart,
+                       angle::ConstStrLen(kXfbReplayOutModifiedMarker), xfbReplayOutputModified);
+    }
+    return result;
 }
 
 std::string GenerateTransformFeedbackVaryingOutput(const gl::TransformFeedbackVarying &varying,
@@ -553,7 +622,7 @@ void GenerateTransformFeedbackEmulationOutputs(
 
     for (uint32_t bufferIndex = 0; bufferIndex < bufferCount; ++bufferIndex)
     {
-        xfbIndices[bufferIndex]      = Str(bufferIndex);
+        xfbIndices[bufferIndex] = Str(bufferIndex);
 
         std::string bufferName = GetXfbBufferNameMtl(bufferIndex);
 
@@ -586,7 +655,31 @@ void GenerateTransformFeedbackEmulationOutputs(
     }
     xfbOut += "    }\n#endif\n";
 
-    *vertexShader = SubstituteTransformFeedbackMarkers(*vertexShader, xfbBindings, xfbOut);
+    const std::string xfbReplayInput = "#if TRANSFORM_FEEDBACK_REPLAY\n"
+                                       "    uint ANGLE_xfbReplayIndex = ANGLE_vertexIDMetal - "
+                                       "uint(ANGLE_angleUniforms.ANGLE_xfbReplayVertexOffset) + "
+                                       "(ANGLE_instanceIdMod - ANGLE_baseInstance) * "
+                                       "uint(ANGLE_angleUniforms.ANGLE_xfbVerticesPerInstance);\n"
+                                       "    return ANGLE_xfbReplayBuffer[ANGLE_xfbReplayIndex];\n"
+                                       "#endif\n";
+
+    auto makeXfbReplayOutput = [](const char *outputName) {
+        std::string output = "#if TRANSFORM_FEEDBACK_ENABLED\n"
+                             "    if (ANGLE_angleUniforms.ANGLE_xfbReplayEnabled != 0)\n"
+                             "    {\n"
+                             "        uint ANGLE_xfbReplayIndex = ANGLE_vertexIDMetal - "
+                             "uint(ANGLE_angleUniforms.ANGLE_xfbReplayVertexOffset) + "
+                             "(ANGLE_instanceIdMod - ANGLE_baseInstance) * "
+                             "uint(ANGLE_angleUniforms.ANGLE_xfbVerticesPerInstance);\n"
+                             "        ANGLE_xfbReplayBuffer[ANGLE_xfbReplayIndex] = ";
+        output += outputName;
+        output += ";\n    }\n#endif\n";
+        return output;
+    };
+
+    *vertexShader = SubstituteTransformFeedbackMarkers(
+        *vertexShader, xfbBindings, xfbOut, xfbReplayInput, makeXfbReplayOutput("ANGLE_vertexOut"),
+        makeXfbReplayOutput("ANGLE_vertexOutMod"));
 }
 
 angle::Result MTLGetMSL(const angle::FeaturesMtl &features,
@@ -604,6 +697,16 @@ angle::Result MTLGetMSL(const angle::FeaturesMtl &features,
         if (!uboOriginalBindings.count(block.name))
         {
             uboOriginalBindings[block.name] = bufferIdx;
+        }
+    }
+    std::unordered_map<std::string, uint32_t> ssboOriginalBindings;
+    const std::vector<gl::InterfaceBlock> &storageBlocks = executable.getShaderStorageBlocks();
+    for (uint32_t bufferIdx = 0; bufferIdx < storageBlocks.size(); ++bufferIdx)
+    {
+        const gl::InterfaceBlock &block = storageBlocks[bufferIdx];
+        if (!ssboOriginalBindings.count(block.name))
+        {
+            ssboOriginalBindings[block.name] = bufferIdx;
         }
     }
     // Retrieve original sampler bindings produced by front end.
@@ -629,8 +732,15 @@ angle::Result MTLGetMSL(const angle::FeaturesMtl &features,
         originalSamplerBindings[mappedSamplerName].push_back(
             {textureIndex, static_cast<uint32_t>(samplerBinding.textureUnitsCount)});
     }
-    for (gl::ShaderType type : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
+    for (gl::ShaderType type :
+         {gl::ShaderType::Vertex, gl::ShaderType::Fragment, gl::ShaderType::Compute})
     {
+        if (!shadersState[type])
+        {
+            (*mslShaderInfoOut)[type].reset();
+            continue;
+        }
+
         std::string source;
         if (type == gl::ShaderType::Vertex)
         {
@@ -643,7 +753,7 @@ angle::Result MTLGetMSL(const angle::FeaturesMtl &features,
             {
                 if (executable.getLinkedTransformFeedbackVaryings().empty())
                 {
-                    source = SubstituteTransformFeedbackMarkers(source, "", "");
+                    source = SubstituteTransformFeedbackMarkers(source, "", "", "", "", "");
                 }
                 else
                 {
@@ -652,11 +762,16 @@ angle::Result MTLGetMSL(const angle::FeaturesMtl &features,
                 }
             }
         }
-        else
+        else if (type == gl::ShaderType::Fragment)
         {
             ASSERT(type == gl::ShaderType::Fragment);
             const bool defineAlpha0 = features.emulateAlphaToCoverage.enabled;
             source = UpdateFragmentShaderOutputs(shaderSources[type], executable, defineAlpha0);
+        }
+        else
+        {
+            ASSERT(type == gl::ShaderType::Compute);
+            source = shaderSources[type];
         }
         (*mslShaderInfoOut)[type].metalShaderSource =
             std::make_shared<const std::string>(std::move(source));
@@ -682,15 +797,60 @@ angle::Result MTLGetMSL(const angle::FeaturesMtl &features,
                 }
             }
         }
+        if (reflection->hasSSBOs)
+        {
+            (*mslShaderInfoOut)[type].hasSSBOArgumentBuffer = true;
+
+            for (auto &storageBinding : reflection->getStorageBufferBindings())
+            {
+                const std::string &storageName     = storageBinding.first;
+                const sh::UBOBindingInfo &bindInfo = storageBinding.second;
+                const uint32_t storageBindIndex    = static_cast<uint32_t>(bindInfo.bindIndex);
+                const uint32_t storageArraySize    = static_cast<uint32_t>(bindInfo.arraySize);
+                uint32_t originalBinding           = 0;
+                if (storageName == "ANGLEAtomicCounters")
+                {
+                    originalBinding = kAtomicCounterStorageBufferMappingBase;
+                }
+                else
+                {
+                    bool isAtomicCounterBuffer = false;
+                    for (uint32_t binding = 0;
+                         binding < gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS; ++binding)
+                    {
+                        if (storageName == "ANGLEAtomicCounters_" + std::to_string(binding))
+                        {
+                            originalBinding = kAtomicCounterStorageBufferMappingBase + binding;
+                            isAtomicCounterBuffer = true;
+                            break;
+                        }
+                    }
+                    if (!isAtomicCounterBuffer)
+                    {
+                        originalBinding = ssboOriginalBindings.at(storageName);
+                    }
+                }
+                for (uint32_t i = 0; i < storageArraySize; ++i)
+                {
+                    (*mslShaderInfoOut)[type].actualStorageBufferBindings[originalBinding + i] =
+                        storageBindIndex + i;
+                }
+            }
+        }
         // Retrieve automatic texture slot assignments
         if (originalSamplerBindings.size() > 0)
         {
             GetAssignedSamplerBindings(reflection, originalSamplerBindings, structSamplers,
                                        &mslShaderInfoOut->at(type).actualSamplerBindings);
         }
-        for (uint32_t i = 0; i < kMaxShaderImages; ++i)
+        for (size_t imageIndex = 0; imageIndex < executable.getImageBindings().size(); ++imageIndex)
         {
-            mslShaderInfoOut->at(type).actualImageBindings[i] = reflection->getRWTextureBinding(i);
+            const uint32_t uniformIndex = executable.getUniformIndexFromImageIndex(imageIndex);
+            const std::vector<sh::RWTextureBinding> &imageTextureBindings =
+                GetImageUniformTextureBindings(*reflection,
+                                               executable.getUniformNameByIndex(uniformIndex),
+                                               executable.getUniformMappedNames()[uniformIndex]);
+            mslShaderInfoOut->at(type).actualImageBindings[imageIndex] = imageTextureBindings;
         }
         (*mslShaderInfoOut)[type].hasIsnanOrIsinf = reflection->hasIsnanOrIsinf;
         (*mslShaderInfoOut)[type].hasInvariant    = reflection->hasInvariance;

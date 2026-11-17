@@ -6,6 +6,8 @@
 // RewriteAtomicCounters: Emulate atomic counter buffers with storage buffers.
 //
 
+#include <unordered_map>
+
 #include "compiler/translator/tree_ops/RewriteAtomicCounters.h"
 
 #include "compiler/translator/Compiler.h"
@@ -54,6 +56,39 @@ const TVariable *DeclareAtomicCountersBuffers(TIntermBlock *root, TSymbolTable *
                                          kAtomicCountersVarName);
 }
 
+const TVariable *DeclareAtomicCountersBuffer(TIntermBlock *root,
+                                             TSymbolTable *symbolTable,
+                                             int binding)
+{
+    // MSL does not support arrays of storage-buffer blocks. Declare one block per active atomic
+    // counter binding so the pipeline can pass each buffer as an independent argument.
+    TFieldList *fieldList = new TFieldList;
+    TType *counterType    = new TType(EbtUInt, EbpHigh, EvqGlobal);
+    counterType->makeArray(0);
+    fieldList->push_back(new TField(counterType, kAtomicCounterFieldName, TSourceLoc(),
+                                    SymbolType::AngleInternal));
+
+    TMemoryQualifier coherentMemory = TMemoryQualifier::Create();
+    coherentMemory.coherent         = true;
+
+    ImmutableStringBuilder blockNameBuilder(64);
+    blockNameBuilder << "ANGLEAtomicCounters_" << binding;
+    const ImmutableString blockName = blockNameBuilder;
+
+    ImmutableStringBuilder variableNameBuilder(64);
+    variableNameBuilder << "atomicCounterBuffer_" << binding;
+    const ImmutableString variableName = variableNameBuilder;
+
+    TLayoutQualifier layoutQualifier = TLayoutQualifier::Create();
+    layoutQualifier.blockStorage     = EbsStd430;
+    layoutQualifier.binding          = binding;
+
+    const TInterfaceBlock *interfaceBlock =
+        DeclareInterfaceBlock(symbolTable, fieldList, layoutQualifier, blockName);
+    return DeclareInterfaceBlockVariable(root, symbolTable, EvqBuffer, interfaceBlock,
+                                         layoutQualifier, coherentMemory, 0, variableName);
+}
+
 TIntermTyped *CreateUniformBufferOffset(const TIntermTyped *uniformBufferOffsets, int binding)
 {
     // Each uint in the |acbBufferOffsets| uniform contains offsets for 4 bindings.  Therefore, the
@@ -79,6 +114,7 @@ TIntermTyped *CreateUniformBufferOffset(const TIntermTyped *uniformBufferOffsets
 
 TIntermBinary *CreateAtomicCounterRef(TIntermTyped *atomicCounterExpression,
                                       const TVariable *atomicCounters,
+                                      const std::unordered_map<int, const TVariable *> *buffersByBinding,
                                       const TIntermTyped *uniformBufferOffsets)
 {
     // The atomic counters storage buffer declaration looks as such:
@@ -158,15 +194,23 @@ TIntermBinary *CreateAtomicCounterRef(TIntermTyped *atomicCounterExpression,
         index = new TIntermBinary(EOpAdd, index, CreateIndexNode(offset));
     }
 
-    // Finally, create the complete expression:
-    //
-    //     atomicCounters[binding].counters[index]
+    // Finally, create the complete expression. Most backends use
+    // atomicCounters[binding].counters[index]; MSL uses the separate block variable for binding.
 
-    TIntermSymbol *atomicCountersRef = new TIntermSymbol(atomicCounters);
-
-    // atomicCounters[binding]
-    TIntermBinary *countersBlock =
-        new TIntermBinary(EOpIndexDirect, atomicCountersRef, CreateIndexNode(binding));
+    TIntermTyped *countersBlock = nullptr;
+    if (buffersByBinding != nullptr)
+    {
+        auto bufferIt = buffersByBinding->find(binding);
+        ASSERT(bufferIt != buffersByBinding->end());
+        countersBlock = new TIntermSymbol(bufferIt->second);
+    }
+    else
+    {
+        TIntermSymbol *atomicCountersRef = new TIntermSymbol(atomicCounters);
+        // atomicCounters[binding]
+        countersBlock =
+            new TIntermBinary(EOpIndexDirect, atomicCountersRef, CreateIndexNode(binding));
+    }
 
     // atomicCounters[binding].counters
     TIntermBinary *counters =
@@ -184,9 +228,11 @@ class RewriteAtomicCountersTraverser : public TIntermTraverser
   public:
     RewriteAtomicCountersTraverser(TSymbolTable *symbolTable,
                                    const TVariable *atomicCounters,
+                                   const std::unordered_map<int, const TVariable *> *buffersByBinding,
                                    const TIntermTyped *acbBufferOffsets)
         : TIntermTraverser(true, false, false, symbolTable),
           mAtomicCounters(atomicCounters),
+          mBuffersByBinding(buffersByBinding),
           mAcbBufferOffsets(acbBufferOffsets)
     {}
 
@@ -292,8 +338,9 @@ class RewriteAtomicCountersTraverser : public TIntermTraverser
         TIntermTyped *param = (*node->getSequence())[0]->getAsTyped();
 
         TIntermSequence substituteArguments;
-        substituteArguments.push_back(
-            CreateAtomicCounterRef(param, mAtomicCounters, mAcbBufferOffsets));
+        substituteArguments.push_back(CreateAtomicCounterRef(param, mAtomicCounters,
+                                                              mBuffersByBinding,
+                                                              mAcbBufferOffsets));
         substituteArguments.push_back(CreateUIntNode(valueChange));
 
         TIntermTyped *substituteCall = CreateBuiltInFunctionCallNode(
@@ -311,6 +358,7 @@ class RewriteAtomicCountersTraverser : public TIntermTraverser
     }
 
     const TVariable *mAtomicCounters;
+    const std::unordered_map<int, const TVariable *> *mBuffersByBinding;
     const TIntermTyped *mAcbBufferOffsets;
 };
 
@@ -320,15 +368,36 @@ bool RewriteAtomicCounters(TCompiler *compiler,
                            TIntermBlock *root,
                            TSymbolTable *symbolTable,
                            const TIntermTyped *acbBufferOffsets,
-                           const TVariable **atomicCountersOut)
+                           const TVariable **atomicCountersOut,
+                           const std::vector<int> *separateBufferBindings)
 {
-    const TVariable *atomicCounters = DeclareAtomicCountersBuffers(root, symbolTable);
-    if (atomicCountersOut)
+    const TVariable *atomicCounters = nullptr;
+    std::unordered_map<int, const TVariable *> buffersByBinding;
+    if (separateBufferBindings == nullptr)
     {
-        *atomicCountersOut = atomicCounters;
+        atomicCounters = DeclareAtomicCountersBuffers(root, symbolTable);
+        if (atomicCountersOut)
+        {
+            *atomicCountersOut = atomicCounters;
+        }
+    }
+    else
+    {
+        ASSERT(atomicCountersOut == nullptr);
+        for (int binding : *separateBufferBindings)
+        {
+            if (buffersByBinding.find(binding) == buffersByBinding.end())
+            {
+                buffersByBinding.emplace(
+                    binding, DeclareAtomicCountersBuffer(root, symbolTable, binding));
+            }
+        }
+        ASSERT(!buffersByBinding.empty());
     }
 
-    RewriteAtomicCountersTraverser traverser(symbolTable, atomicCounters, acbBufferOffsets);
+    RewriteAtomicCountersTraverser traverser(
+        symbolTable, atomicCounters,
+        separateBufferBindings == nullptr ? nullptr : &buffersByBinding, acbBufferOffsets);
     root->traverse(&traverser);
     return traverser.updateTree(compiler, root);
 }

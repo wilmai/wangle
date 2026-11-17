@@ -6,6 +6,8 @@
 
 #include "compiler/translator/msl/TranslatorMSL.h"
 
+#include <algorithm>
+
 #include "angle_gl.h"
 #include "common/utilities.h"
 #include "compiler/translator/ImmutableStringBuilder.h"
@@ -24,6 +26,7 @@
 #include "compiler/translator/tree_ops/PreTransformTextureCubeGradDerivatives.h"
 #include "compiler/translator/tree_ops/ReduceInterfaceBlocks.h"
 #include "compiler/translator/tree_ops/RewriteArrayOfArrayOfOpaqueUniforms.h"
+#include "compiler/translator/tree_ops/RewriteAtomicCounters.h"
 #include "compiler/translator/tree_ops/RewriteDfdy.h"
 #include "compiler/translator/tree_ops/RewriteStructSamplers.h"
 #include "compiler/translator/tree_ops/UseGeneratedNamesForAnonymousStructs.h"
@@ -39,6 +42,7 @@
 #include "compiler/translator/tree_ops/msl/RewriteUnaddressableReferences.h"
 #include "compiler/translator/tree_ops/msl/SeparateCompoundExpressions.h"
 #include "compiler/translator/tree_ops/msl/WrapMain.h"
+#include "compiler/translator/tree_ops/spirv/RewriteR32fImages.h"
 #include "compiler/translator/tree_util/BuiltIn.h"
 #include "compiler/translator/tree_util/DriverUniform.h"
 #include "compiler/translator/tree_util/FindFunction.h"
@@ -48,6 +52,7 @@
 #include "compiler/translator/tree_util/ReplaceClipCullDistanceVariable.h"
 #include "compiler/translator/tree_util/ReplaceVariable.h"
 #include "compiler/translator/tree_util/RunAtTheBeginningOfShader.h"
+
 #include "compiler/translator/tree_util/RunAtTheEndOfShader.h"
 #include "compiler/translator/util.h"
 
@@ -59,6 +64,86 @@ namespace
 
 constexpr Name kFlippedPointCoordName("flippedPointCoord", SymbolType::AngleInternal);
 constexpr Name kFlippedFragCoordName("flippedFragCoord", SymbolType::AngleInternal);
+
+bool IsMetalImage2D(TBasicType type)
+{
+    return type == EbtImage2D || type == EbtIImage2D || type == EbtUImage2D;
+}
+
+TIntermSymbol *GetRootSymbol(TIntermNode *node)
+{
+    while (TIntermBinary *binary = node->getAsBinaryNode())
+    {
+        node = binary->getLeft();
+    }
+    return node->getAsSymbolNode();
+}
+
+class AddImageLayerUniformsTraverser : public TIntermTraverser
+{
+  public:
+    explicit AddImageLayerUniformsTraverser(DriverUniformMetal *driverUniforms)
+        : TIntermTraverser(true, false, false), mDriverUniforms(driverUniforms)
+    {}
+
+    bool visitAggregate(Visit, TIntermAggregate *aggregate) override
+    {
+        const TOperator op       = aggregate->getOp();
+        const bool isImageAtomic = BuiltInGroup::IsImageAtomic(op);
+        if (op != TOperator::EOpImageSize && op != TOperator::EOpImageLoad &&
+            op != TOperator::EOpImageStore && !isImageAtomic)
+        {
+            return true;
+        }
+
+        TIntermSequence *arguments = aggregate->getSequence();
+        const size_t expectedArgumentCount =
+            isImageAtomic
+                ? (op == TOperator::EOpImageAtomicCompSwap ? 4 : 3)
+                : (op == TOperator::EOpImageSize ? 1 : (op == TOperator::EOpImageLoad ? 2 : 3));
+        if (arguments->size() != expectedArgumentCount)
+        {
+            return true;
+        }
+
+        TIntermTyped *imageArgument = arguments->front()->getAsTyped();
+        ASSERT(imageArgument);
+        if (!IsMetalImage2D(imageArgument->getType().getBasicType()))
+        {
+            return true;
+        }
+
+        TIntermSymbol *rootSymbol = GetRootSymbol(arguments->front());
+        if (rootSymbol && rootSymbol->variable().getType().getQualifier() == TQualifier::EvqParamIn)
+        {
+            return true;
+        }
+
+        int binding = imageArgument->getType().getLayoutQualifier().binding;
+        if (binding < 0)
+        {
+            binding = 0;
+        }
+        if (TIntermBinary *imageArrayAccess = arguments->front()->getAsBinaryNode();
+            imageArrayAccess && imageArrayAccess->getOp() == TOperator::EOpIndexDirect &&
+            imageArrayAccess->getLeft()->getType().isArray())
+        {
+            const TConstantUnion *arrayIndex = imageArrayAccess->getRight()->getConstantValue();
+            if (arrayIndex && arrayIndex->getType() == EbtInt)
+            {
+                binding += arrayIndex->getIConst();
+            }
+        }
+
+        TIntermTyped *imageLayers = mDriverUniforms->getImageLayersField();
+        arguments->push_back(
+            new TIntermBinary(EOpIndexDirect, imageLayers, CreateIndexNode(binding)));
+        return true;
+    }
+
+  private:
+    DriverUniformMetal *mDriverUniforms;
+};
 
 class DeclareStructTypesTraverser : public TIntermTraverser
 {
@@ -144,7 +229,7 @@ TIntermSequence *GetMainSequence(TIntermBlock *root)
 
     // Create a swizzle to "builtin.xy"
     TVector<uint32_t> swizzleOffsetXY = {0, 1};
-    TIntermSwizzle *builtinXY    = new TIntermSwizzle(builtinRef, swizzleOffsetXY);
+    TIntermSwizzle *builtinXY         = new TIntermSwizzle(builtinRef, swizzleOffsetXY);
 
     // Create a symbol reference to our new variable that will hold the modified builtin.
     const TType *type =
@@ -631,6 +716,19 @@ void AddFragDepthEXTDeclaration(TCompiler &compiler, TIntermBlock &root, TSymbol
                                &symbolTable);
 }
 
+[[nodiscard]] bool AppendVertexShaderTransformFeedbackReplayInputToMain(TCompiler &compiler,
+                                                                        SymbolEnv &mSymbolEnv,
+                                                                        TIntermBlock &root)
+{
+    // The Metal renderer replaces this call in a replay shader variant.  Keeping it in the
+    // translated shader lets the replay path return captured stage output before executing any
+    // application shader code or side effects.
+    return RunAtTheBeginningOfShader(
+        &compiler, &root,
+        &(mSymbolEnv.callFunctionOverload(Name("@@XFB-REPLAY@@"), *new TType(),
+                                          *new TIntermSequence())));
+}
+
 // Unlike Vulkan having auto viewport flipping extension, in Metal we have to flip gl_Position.y
 // manually.
 // This operation performs flipping the gl_Position.y using this expression:
@@ -775,7 +873,7 @@ bool TranslatorMSL::transformDepthBeforeCorrection(TIntermBlock *root,
 
     // Create a swizzle to "gl_Position.z"
     TVector<uint32_t> swizzleOffsetZ = {2};
-    TIntermSwizzle *positionZ   = new TIntermSwizzle(positionRef, swizzleOffsetZ);
+    TIntermSwizzle *positionZ        = new TIntermSwizzle(positionRef, swizzleOffsetZ);
 
     // Create a ref to "zscale"
     TIntermTyped *viewportZScale = driverUniforms->getViewportZScale();
@@ -807,12 +905,12 @@ bool TranslatorMSL::appendVertexShaderDepthCorrectionToMain(
     TIntermSymbol *positionRef = new TIntermSymbol(position);
 
     TVector<uint32_t> swizzleOffsetZ = {2};
-    TIntermSwizzle *positionZ   = new TIntermSwizzle(positionRef, swizzleOffsetZ);
+    TIntermSwizzle *positionZ        = new TIntermSwizzle(positionRef, swizzleOffsetZ);
 
     TIntermConstantUnion *oneHalf = CreateFloatNode(0.5f, EbpMedium);
 
     TVector<uint32_t> swizzleOffsetW = {3};
-    TIntermSwizzle *positionW   = new TIntermSwizzle(positionRef->deepCopy(), swizzleOffsetW);
+    TIntermSwizzle *positionW        = new TIntermSwizzle(positionRef->deepCopy(), swizzleOffsetW);
 
     // Create the expression "(gl_Position.z + gl_Position.w) * 0.5".
     TIntermBinary *zPlusW = new TIntermBinary(EOpAdd, positionZ->deepCopy(), positionW->deepCopy());
@@ -840,7 +938,6 @@ static inline MetalShaderType metalShaderTypeFromGLSL(sh::GLenum shaderType)
         case GL_FRAGMENT_SHADER:
             return MetalShaderType::Fragment;
         case GL_COMPUTE_SHADER:
-            ASSERT(0 && "compute shaders not currently supported");
             return MetalShaderType::Compute;
         default:
             ASSERT(0 && "Invalid shader type.");
@@ -856,6 +953,7 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
 {
     TSymbolTable &symbolTable = getSymbolTable();
     IdGen idGen;
+    const bool isComputeShader = getShaderType() == GL_COMPUTE_SHADER;
     ProgramPreludeConfig ppc(metalShaderTypeFromGLSL(getShaderType()));
     ppc.allowSamplerCompareGradient = compileOptions.metal.allowSamplerCompareGradient;
     ppc.writeHelperSampleMask = compileOptions.metal.writeHelperSampleMask && usesDerivatives();
@@ -872,19 +970,36 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
         return false;
     }
 
-    if (!WrapMain(*this, idGen, *root))
+    // Graphics shaders use a wrapper to adapt the GLSL main return value to Metal's stage
+    // interface.  Compute shaders are emitted as the Metal kernel entry point directly so the
+    // thread-position built-ins can be supplied by Metal.
+    if (!isComputeShader && !WrapMain(*this, idGen, *root))
     {
         return false;
     }
 
     // Write out default uniforms into a uniform block assigned to a specific set/binding.
     int aggregateTypesUsedForUniforms = 0;
+    bool hasActiveAtomicCounters      = false;
+    bool hasImage2DUniforms           = false;
+    std::vector<int> atomicCounterBindings;
     for (const auto &uniform : getUniforms())
     {
         if (uniform.isStruct() || uniform.isArrayOfArrays())
         {
             ++aggregateTypesUsedForUniforms;
         }
+        if (uniform.active && gl::IsAtomicCounterType(uniform.type))
+        {
+            hasActiveAtomicCounters = true;
+            if (std::find(atomicCounterBindings.begin(), atomicCounterBindings.end(),
+                          uniform.binding) == atomicCounterBindings.end())
+            {
+                atomicCounterBindings.push_back(uniform.binding);
+            }
+        }
+        hasImage2DUniforms |=
+            uniform.active && gl::IsImageType(uniform.type) && gl::IsImage2DType(uniform.type);
     }
 
     if (compileOptions.rescopeGlobalVariables)
@@ -909,7 +1024,8 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     {
         UnsupportedFunctionArgsBitSet args{UnsupportedFunctionArgs::StructContainingSamplers,
                                            UnsupportedFunctionArgs::ArrayOfArrayOfSamplerOrImage,
-                                           UnsupportedFunctionArgs::Image};
+                                           UnsupportedFunctionArgs::Image,
+                                           UnsupportedFunctionArgs::AtomicCounter};
         if (!MonomorphizeUnsupportedFunctions(this, root, &getSymbolTable(), args))
         {
             return false;
@@ -932,6 +1048,14 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
         }
     }
 
+    // Metal 3.1 image atomics operate on integer texture formats.  Rewrite r32f images to r32ui
+    // and preserve float load/store/exchange semantics with bit casts, as the Vulkan backend does.
+    if (compileOptions.emulateR32fImageAtomicExchange &&
+        !RewriteR32fImages(this, root, &getSymbolTable()))
+    {
+        return false;
+    }
+
     if (getShaderVersion() >= 300 ||
         IsExtensionEnabled(getExtensionBehavior(), TExtension::EXT_shader_texture_lod))
     {
@@ -945,20 +1069,45 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
         }
     }
 
-    ASSERT(getShaderType() != GL_COMPUTE_SHADER && "compute shaders not currently supported");
-
-    if (compileOptions.useIR)
+    if (!isComputeShader)
     {
-        driverUniforms->findDeclarationAddedByIR(root);
+        if (compileOptions.useIR)
+        {
+            driverUniforms->findDeclarationAddedByIR(root);
+        }
+        else
+        {
+            driverUniforms->addGraphicsDriverUniformsToShader(root, &getSymbolTable());
+        }
+
+        if (!ReplaceGLDepthRangeWithDriverUniform(this, root, driverUniforms, &getSymbolTable()))
+        {
+            return false;
+        }
     }
-    else
+    else if (hasActiveAtomicCounters || hasImage2DUniforms)
     {
-        driverUniforms->addGraphicsDriverUniformsToShader(root, &getSymbolTable());
+        if (compileOptions.useIR)
+        {
+            driverUniforms->findDeclarationAddedByIR(root);
+        }
+        else
+        {
+            driverUniforms->addComputeDriverUniformsToShader(root, &symbolTable);
+        }
     }
 
-    if (!ReplaceGLDepthRangeWithDriverUniform(this, root, driverUniforms, &getSymbolTable()))
+    if (hasActiveAtomicCounters &&
+        !RewriteAtomicCounters(this, root, &symbolTable, driverUniforms->getAcbBufferOffsets(),
+                               nullptr, &atomicCounterBindings))
     {
         return false;
+    }
+
+    if (hasImage2DUniforms)
+    {
+        AddImageLayerUniformsTraverser addImageLayerUniforms(driverUniforms);
+        root->traverse(&addImageLayerUniforms);
     }
 
     {
@@ -990,8 +1139,8 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
             AddBuiltInDeclaration(*root, symbolTable, *BuiltInVariable::gl_VertexID());
         }
     }
-    SymbolEnv symbolEnv(*this, *root);
 
+    SymbolEnv symbolEnv(*this, *root);
     bool usesSampleMask = false;
     if (getShaderType() == GL_FRAGMENT_SHADER)
     {
@@ -1230,6 +1379,11 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
             return false;
         }
 
+        if (!AppendVertexShaderTransformFeedbackReplayInputToMain(*this, symbolEnv, *root))
+        {
+            return false;
+        }
+
         if (getClipDistanceArraySize())
         {
             if (!ZeroDisabledClipDistanceAssignments(this, root, &getSymbolTable(), getShaderType(),
@@ -1295,22 +1449,18 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     {
         return false;
     }
-
     if (!ConvertUnsupportedConstructorsToFunctionCalls(*this, *root))
     {
         return false;
     }
-
     if (!AddExplicitTypeCasts(*this, *root, symbolEnv))
     {
         return false;
     }
-
     if (!SeparateCompoundExpressions(*this, symbolEnv, idGen, *root))
     {
         return false;
     }
-
     if (!ReduceInterfaceBlocks(*this, *root,
                                [&idGen]() { return idGen.createNewName().rawName(); }))
     {
@@ -1327,8 +1477,13 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     mValidateASTOptions.validateQualifiers = false;
 
     PipelineStructs pipelineStructs;
-    if (!RewritePipelines(*this, *root, getInputVaryings(), getOutputVaryings(), idGen,
-                          *driverUniforms, symbolEnv, pipelineStructs))
+    const bool validateVariableReferences          = mValidateASTOptions.validateVariableReferences;
+    mValidateASTOptions.validateVariableReferences = false;
+    const bool rewritePipelinesSucceeded =
+        RewritePipelines(*this, *root, getInputVaryings(), getOutputVaryings(), idGen,
+                         *driverUniforms, symbolEnv, pipelineStructs);
+    mValidateASTOptions.validateVariableReferences = validateVariableReferences;
+    if (!rewritePipelinesSucceeded)
     {
         return false;
     }
@@ -1345,12 +1500,10 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     {
         return false;
     }
-
     if (!RewriteUnaddressableReferences(*this, *root, symbolEnv))
     {
         return false;
     }
-
     if (!RewriteOutArgs(*this, *root, symbolEnv))
     {
         return false;
@@ -1367,7 +1520,6 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     {
         return false;
     }
-
     ASSERT(validateAST(root));
 
     return true;

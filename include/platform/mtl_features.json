@@ -8,6 +8,13 @@
     ],
     "features": [
         {
+            "name": "enable_experimental_gles31",
+            "category": "Features",
+            "description": [
+                "Expose the deliberately scoped, opt-in experimental GLES 3.1 Metal profile."
+            ]
+        },
+        {
             "name": "has_base_vertex_instanced_draw",
             "category": "Features",
             "description": [
